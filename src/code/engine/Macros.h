@@ -145,7 +145,19 @@ struct DrawSurfObject {
 	int idSize;
 };
 
+#ifdef CLOTH_HAVE_OPENMP
 const int OPENMP_ENABLED = true;
 #include <omp.h>
+#else
+// Built without OpenMP (CMake makes it optional — the mingw-llvm
+// toolchain ships no libomp). The `#pragma omp` sites are ignored by
+// the compiler, and these stubs stand in for the handful of API calls
+// so no call site needs its own guard.
+const int OPENMP_ENABLED = false;
+inline void omp_set_num_threads(int) {}
+inline int omp_get_num_threads() { return 1; }
+inline int omp_get_max_threads() { return 1; }
+inline int omp_get_thread_num() { return 0; }
+#endif
 
 #endif // OMEGAENGINE_MACROS_H

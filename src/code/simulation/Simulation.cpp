@@ -31,6 +31,8 @@
 
 #ifdef __APPLE__
 #include "../slang_solver/MetalCGSolver.h"
+#endif
+#ifdef CLOTH_HAVE_GPU_AVBD
 #include "../slang_solver/AvbdSolver.h"
 #include "../slang_solver/AvbdBackwardShim.h"
 #endif
@@ -56,26 +58,140 @@ namespace {
     //   AVBD_NO_SKIP_PD=1    — also iterate PD's CG (waste)
     //   AVBD_NO_CONTACT=1    — skip primitive projection
     //   AVBD_NO_SELF_COLLISION=1 — skip cloth-cloth resolution
+    // ------------------------------------------------------------------
+    // AVBD configuration.
+    //
+    // These knobs used to be read as function-local `static` getenv
+    // calls scattered across the file, which made a run's behaviour a
+    // function of the ambient environment with nothing in the log
+    // saying what actually executed — two runs of the same command
+    // could differ and you could not tell after the fact. They are
+    // resolved once here instead, every default is stated explicitly,
+    // and `dump()` prints the effective configuration at scene init so
+    // every run is self-describing. Env vars remain as overrides for
+    // A/B work; the DEFAULTS are the supported configuration.
+    // ------------------------------------------------------------------
+    struct AvbdConfig {
+        bool usePD = false;          // USE_PD: run PD instead of AVBD
+
+        // Solver. iters defaulted to 1 historically, which does NOT
+        // converge: the AVBD/predictor drift is identical at 1 and 16
+        // iterations, so a 1-iteration sweep sits at the predictor
+        // rather than the solution. CHI-111's IFT note asks for >=4 and
+        // "preferably 16+" for the per-vertex H to be a faithful
+        // Jacobian, so 16 is the default.
+        int  iters       = 16;       // AVBD_ITERS
+        float damp       = 1.0f;     // AVBD_DAMP: velocity in predictor
+        float relax      = 1.0f;     // AVBD_RELAX: <1 enables under-relax
+        bool colors      = true;     // AVBD_NO_COLORS=1 -> block Jacobi
+        bool drive       = true;     // AVBD_NO_DRIVE=1  -> shadow only
+        bool skipPD      = true;     // AVBD_NO_SKIP_PD=1 -> also run PD CG
+
+        // Constraints. rawStiffness restores the pre-fix uploads, which
+        // dropped PD's area weighting and left the membrane ~57x too
+        // stiff and bending ~85x too soft.
+        bool membrane    = true;     // AVBD_NO_MEMBRANE=1
+        bool bending     = true;     // AVBD_NO_BENDING=1
+        bool rawStiffness = false;   // AVBD_RAW_STIFFNESS=1
+
+        // Augmented Lagrangian.
+        bool  al         = false;    // AVBD_AL=1
+        bool  alGammaSet = false;    // AVBD_AL_GAMMA=<scale>
+        float alGamma    = 1.0f;
+
+        // Contact / friction (applied CPU-side after the solve).
+        bool contact      = true;    // AVBD_NO_CONTACT=1
+        bool frictionPred = true;    // AVBD_NO_FRICTION_PRED=1
+        bool selfCollision = true;   // AVBD_NO_SELF_COLLISION=1
+        int  selfPasses    = 2;      // AVBD_SELF_PASSES
+        bool gpuSelf       = true;   // AVBD_GPU_SELF=0 -> CPU hash
+
+        // Adjoint.
+        bool useAvbdBwd  = false;    // USE_AVBD_BWD=1
+        int  bwdTruncateK = 20;      // AVBD_BWD_TRUNCATE_K (0 = full)
+        bool bwdIft      = false;    // AVBD_BWD_IFT=1
+
+        static bool flagSet(const char *n) { return std::getenv(n) != nullptr; }
+
+        void load() {
+            usePD = flagSet("USE_PD");
+            if (const char *e = std::getenv("AVBD_ITERS")) iters = std::max(1, std::atoi(e));
+            if (const char *e = std::getenv("AVBD_DAMP")) damp = float(std::atof(e));
+            if (const char *e = std::getenv("AVBD_RELAX")) relax = float(std::atof(e));
+            colors  = !flagSet("AVBD_NO_COLORS");
+            drive   = !flagSet("AVBD_NO_DRIVE");
+            skipPD  = !flagSet("AVBD_NO_SKIP_PD");
+            membrane = !flagSet("AVBD_NO_MEMBRANE");
+            bending  = !flagSet("AVBD_NO_BENDING");
+            rawStiffness = flagSet("AVBD_RAW_STIFFNESS");
+            al = flagSet("AVBD_AL");
+            if (const char *e = std::getenv("AVBD_AL_GAMMA")) {
+                alGammaSet = true;
+                alGamma = float(std::atof(e));
+            }
+            contact       = !flagSet("AVBD_NO_CONTACT");
+            frictionPred  = !flagSet("AVBD_NO_FRICTION_PRED");
+            selfCollision = !flagSet("AVBD_NO_SELF_COLLISION");
+            if (const char *e = std::getenv("AVBD_SELF_PASSES"))
+                selfPasses = std::max(1, std::atoi(e));
+            if (const char *e = std::getenv("AVBD_GPU_SELF"))
+                gpuSelf = (std::string(e) != "0");
+            useAvbdBwd = flagSet("USE_AVBD_BWD");
+            if (const char *e = std::getenv("AVBD_BWD_TRUNCATE_K"))
+                bwdTruncateK = std::atoi(e);
+            bwdIft = flagSet("AVBD_BWD_IFT");
+        }
+
+        void dump() const {
+            std::printf(
+                "[avbd-config] solver=%s iters=%d damp=%g relax=%g colors=%d "
+                "drive=%d skipPD=%d | membrane=%d bending=%d rawStiffness=%d | "
+                "al=%d gamma=%s | contact=%d frictionPred=%d selfColl=%d "
+                "passes=%d gpuSelf=%d | bwd=%s truncateK=%d ift=%d\n",
+                usePD ? "PD" : "AVBD", iters, damp, relax, int(colors),
+                int(drive), int(skipPD), int(membrane), int(bending),
+                int(rawStiffness), int(al),
+                alGammaSet ? "set" : "default", int(contact),
+                int(frictionPred), int(selfCollision), selfPasses,
+                int(gpuSelf), useAvbdBwd ? "AVBD" : "PD", bwdTruncateK,
+                int(bwdIft));
+        }
+    };
+
+    AvbdConfig &avbdCfg() {
+        static AvbdConfig cfg = [] {
+            AvbdConfig c;
+            c.load();
+            // Printed exactly once, on first use, so every run's log
+            // records the configuration it actually ran with.
+            c.dump();
+            return c;
+        }();
+        return cfg;
+    }
+
     bool g_usePD    = (std::getenv("USE_PD") != nullptr);
     bool g_useAvbd  = !g_usePD;
 
     // CHI-11 subtask 1: when AVBD will drive every step and the PD CG
-    // loop is short-circuited (default on Apple Silicon), the only
-    // per-step PD state that matters is what backward() reads. The
-    // forward-only PD kernels — Msolver factorization, M*s_n,
-    // P*x_n, the b vector — are pure waste. This gate skips them.
-    // AVBD_NO_SKIP_PD=1 re-enables the PD CG loop for shadow
-    // comparison; in that case PD must keep its full forward state.
+    // loop is short-circuited, the only per-step PD state that matters
+    // is what backward() reads. The forward-only PD kernels — Msolver
+    // factorization, M*s_n, P*x_n, the b vector — are pure waste. This
+    // gate skips them. AVBD_NO_SKIP_PD=1 re-enables the PD CG loop for
+    // shadow comparison; in that case PD keeps its full forward state.
     bool pdForwardActive() {
         if (g_usePD) return true;
-        return std::getenv("AVBD_NO_SKIP_PD") != nullptr;
+        return !avbdCfg().skipPD;
     }
 
-    // metallib search path. Override with SLANG_METALLIB_DIR=... in env.
+    // Where the compiled kernels live: .metallib on Apple, .spv under
+    // Vulkan. Both backends are built into tests/slang_validate/build
+    // by that directory's Makefile, so default to this checkout's copy
+    // rather than an absolute path from one developer's machine.
+    // Override with SLANG_METALLIB_DIR=... in the environment.
     std::string slangMetallibDir() {
         if (const char* env = std::getenv("SLANG_METALLIB_DIR")) return env;
-        return "/Users/ernest.lee/Desktop/TOOL_cloth_dynamics/"
-               "tests/slang_validate/build";
+        return std::string(SOURCE_PATH) + "/tests/slang_validate/build";
     }
 
 #ifdef __APPLE__
@@ -1257,7 +1373,7 @@ void Simulation::step() {
 	returnRecord.v_prev = v_n;
 	returnRecord.s_n = s_n;
 
-#ifdef __APPLE__
+#ifdef CLOTH_HAVE_GPU_AVBD
 	// PR-E shadow shuttle: when USE_AVBD=1 and AvbdSolver is loaded,
 	// dispatch one full AVBD outer iteration in parallel with the PD
 	// path. The result is read back into a scratch buffer for logging;
@@ -1269,22 +1385,13 @@ void Simulation::step() {
 		// iterations run per Simulation::step(). Real convergence
 		// needs ~4-50 iters depending on stiffness; 1 is the
 		// shadow-timing baseline.
-		static const int s_avbdIters = []() {
-			if (const char* e = std::getenv("AVBD_ITERS"))
-				return std::max(1, std::atoi(e));
-			return 1;
-		}();
+		const int s_avbdIters = avbdCfg().iters;
 		// AVBD_DAMP scales velocity contribution in the AVBD predictor.
 		// Tests the hypothesis that dress's per-vertex GS oscillation
 		// is kinetic-energy-driven (PR #84 finding). damp < 1.0 bleeds
 		// off velocity before the implicit Euler predictor is built.
 		// Affects ONLY the AVBD shadow path; PD's s_n is untouched.
-		static const float s_avbdDamp = []() {
-			if (const char* e = std::getenv("AVBD_DAMP")) {
-				return float(std::atof(e));
-			}
-			return 1.0f;
-		}();
+		const float s_avbdDamp = avbdCfg().damp;
 		const uint32_t nV = uint32_t(particles.size());
 		std::vector<float> posF(3 * nV), predF(3 * nV);
 		// PD's predictor s_n = x_n + h·v_n + h²·M_inv·f_ext. When
@@ -1336,9 +1443,9 @@ void Simulation::step() {
 		//
 		// Disable via AVBD_NO_FRICTION_PRED=1.
 		const bool s_avbdNoFricPred =
-				(std::getenv("AVBD_NO_FRICTION_PRED") != nullptr);
+				!avbdCfg().frictionPred;
 		const bool s_avbdNoContact_local =
-				(std::getenv("AVBD_NO_CONTACT") != nullptr);
+				!avbdCfg().contact;
 		if (!s_avbdNoContact_local && !s_avbdNoFricPred) {
 			auto applyFriction = [&](size_t i, const Vec3d &nrm,
 									 const Primitive *p) {
@@ -1427,7 +1534,7 @@ void Simulation::step() {
 		// attachments. After each outer iter's step(), dispatch
 		// stepDualAttachments() to nudge λ toward zero constraint
 		// violation. Default off (use the bit-equivalent λ=0 path).
-		static const bool s_avbdAl = (std::getenv("AVBD_AL") != nullptr);
+		const bool s_avbdAl = avbdCfg().al;
 
 		// AVBD_RELAX=ω ∈ (0,1] applies host-side under-relaxation
 		// between iters: after each step(), readback positions, blend
@@ -1436,11 +1543,7 @@ void Simulation::step() {
 		// At ω = 1 (default) the loop is bit-identical to pre-PR.
 		// Cost: one Metal readback + reupload per iter (~50µs ea on
 		// dress). Skipped entirely when ω == 1 to keep the hot path.
-		static const float s_avbdRelax = []() {
-			if (const char* e = std::getenv("AVBD_RELAX"))
-				return float(std::atof(e));
-			return 1.0f;
-		}();
+		const float s_avbdRelax = avbdCfg().relax;
 		const bool useRelax = (s_avbdRelax > 0.0f && s_avbdRelax < 1.0f);
 
 		// Convenience lambda for one iter + optional relaxation.
@@ -1646,9 +1749,9 @@ void Simulation::step() {
 		// pure waste — the loop runs zero iterations and AVBD_DRIVE
 		// overwrites particles[i].{pos, velocity}. AVBD_NO_SKIP_PD=1
 		// or AVBD_NO_DRIVE=1 keeps PD active for shadow comparison.
-#ifdef __APPLE__
+#ifdef CLOTH_HAVE_GPU_AVBD
 		static const bool s_avbdDriveEnv =
-		    (std::getenv("AVBD_NO_DRIVE") == nullptr);
+		    avbdCfg().drive;
 		const bool avbdWillDrive = s_avbdDriveEnv && g_useAvbd &&
 		    currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok();
 		const bool runPDLoop = pdForwardActive() || !avbdWillDrive;
@@ -1935,7 +2038,7 @@ void Simulation::step() {
 	returnRecord.f = f;
 	returnRecord.r = r;
 
-#ifdef __APPLE__
+#ifdef CLOTH_HAVE_GPU_AVBD
 	// Per-step PD displacement |x_new − x_n| for direct comparison
 	// with avbd-shadow's dxMax/dxMean (which measures |avbd − x_n|).
 	// If pd_dx_max and avbd_dx_max diverge much, the AVBD solve
@@ -1997,14 +2100,14 @@ void Simulation::step() {
 	if (s_benchPerStep) {
 		auto _bench_us = std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now() - _bench_t0).count();
-#ifdef __APPLE__
+#ifdef CLOTH_HAVE_GPU_AVBD
 		// Pick the label for what actually drove the step:
 		//   AVBD_DRIVE + AVBD_SKIP_PD → AVBD's solve, no PD CG
 		//   AVBD_DRIVE alone           → AVBD's solve after PD ran (PD output discarded)
 		//   slangCG                    → custom slang CG path
 		//   default                    → DiffCloth's Eigen LLT-preconditioned PD
-		static const bool s_benchDrive   = (std::getenv("AVBD_NO_DRIVE")   == nullptr);
-		static const bool s_benchSkipPD  = (std::getenv("AVBD_NO_SKIP_PD") == nullptr);
+		static const bool s_benchDrive   = avbdCfg().drive;
+		static const bool s_benchSkipPD  = avbdCfg().skipPD;
 		const bool avbdDroveThis = s_benchDrive && g_useAvbd && currentSysmatId == 0 &&
 		    sysMat[0].avbd && sysMat[0].avbd->ok();
 		const char* path =
@@ -2022,7 +2125,7 @@ void Simulation::step() {
 			static_cast<long long>(_bench_us));
 	}
 
-#ifdef __APPLE__
+#ifdef CLOTH_HAVE_GPU_AVBD
 	// AVBD_DRIVE=1 commits AVBD's shadow output as the simulation
 	// outcome — overrides PD's converged Particle.pos and recomputes
 	// velocity from the AVBD delta. Use ONLY when you've verified
@@ -2039,7 +2142,7 @@ void Simulation::step() {
 	// AVBD_DRIVE is default-on under AVBD; AVBD_NO_DRIVE=1 disables it
 	// so PD's converged Particle.pos is preserved (useful for shadow
 	// comparison or debugging).
-	static const bool s_avbdDrive = (std::getenv("AVBD_NO_DRIVE") == nullptr);
+	static const bool s_avbdDrive = avbdCfg().drive;
 	const bool s_avbdDriveActive = s_avbdDrive && g_useAvbd && currentSysmatId == 0 &&
 	    sysMat[0].avbd && sysMat[0].avbd->ok();
 	if (s_avbdDriveActive) {
@@ -2071,7 +2174,7 @@ void Simulation::step() {
 		// inward-normal velocity component (sticky / no-bounce).
 		// Default-on when DRIVE is set; AVBD_NO_CONTACT=1 disables.
 		// Self-collision (cloth-cloth) is a follow-up.
-		const bool s_avbdNoContact = (std::getenv("AVBD_NO_CONTACT") != nullptr);
+		const bool s_avbdNoContact = !avbdCfg().contact;
 		if (!s_avbdNoContact) {
 			size_t projHits = 0;
 			size_t frictionHits = 0;
@@ -2136,12 +2239,8 @@ void Simulation::step() {
 		// since resolving one pair can introduce new overlaps in dense
 		// folds. AVBD_NO_SELF_COLLISION=1 disables. Respects DiffCloth's
 		// existing Simulation::selfcollisionEnabled flag.
-		const bool s_avbdNoSelf = (std::getenv("AVBD_NO_SELF_COLLISION") != nullptr);
-		static const int s_avbdSelfPasses = []() {
-			if (const char* e = std::getenv("AVBD_SELF_PASSES"))
-				return std::max(1, std::atoi(e));
-			return 2;
-		}();
+		const bool s_avbdNoSelf = !avbdCfg().selfCollision;
+		const int s_avbdSelfPasses = avbdCfg().selfPasses;
 		// Default detection path is the GPU brute-force scan (#104/#105).
 		// AVBD_GPU_SELF=0 falls back to the CPU spatial-hash via
 		// Simulation::collisionDetection() — kept as a safety net during
@@ -2149,10 +2248,7 @@ void Simulation::step() {
 		// positions are still on the GPU after the iter loop, so passing
 		// AVBD's solver buffer to detectSelfCollisions() avoids the
 		// readback-then-upload round-trip the CPU path needs anyway.
-		static const bool s_avbdCpuSelf = []() {
-			const char* e = std::getenv("AVBD_GPU_SELF");
-			return e && std::string(e) == "0";
-		}();
+		const bool s_avbdCpuSelf = !avbdCfg().gpuSelf;
 		if (!s_avbdNoSelf && selfcollisionEnabled) {
 			size_t resolvedTotal = 0;
 			long long detectUs = 0, resolveUs = 0;
@@ -4078,6 +4174,9 @@ void Simulation::initializePrefactoredMatrices() {
 			}
 		}
 
+#endif  // __APPLE__
+
+#ifdef CLOTH_HAVE_GPU_AVBD
 		if (g_useAvbd && sysMatId == 0) {
 			// PR-E continued: instantiate AvbdSolver at scene init and
 			// upload mesh state (positions, masses, invH²). Constraint
@@ -4134,7 +4233,7 @@ void Simulation::initializePrefactoredMatrices() {
 				// AVBD's membrane kernel needs this — without it every
 				// triangle is treated as canonical/equilateral rest,
 				// pulling the mesh toward an unphysical equilibrium.
-				const bool s_avbdNoMembrane = (std::getenv("AVBD_NO_MEMBRANE") != nullptr);
+				const bool s_avbdNoMembrane = !avbdCfg().membrane;
 				const uint32_t nT = s_avbdNoMembrane ? 0u : uint32_t(mesh.size());
 				if (s_avbdNoMembrane)
 					std::printf("[avbd] AVBD_NO_MEMBRANE=1: skipping %zu triangle uploads\n",
@@ -4142,9 +4241,25 @@ void Simulation::initializePrefactoredMatrices() {
 				std::vector<uint32_t> triIdx(3 * nT);
 				std::vector<float>    triInvUV(4 * nT);
 				std::vector<float>    triK(nT, float(Triangle::k_stiff));
+				// Dimensional fix: PD weights the membrane energy by
+				// `k_stiff * area_rest` everywhere (Triangle.cpp:54, 90,
+				// 169; constrainWeightSqrt = sqrt(area_rest * k_stiff)),
+				// but the Slang kernel consumes `stiffness[c]` raw --
+				// it uses inv_deltaUV only to build F and never recovers
+				// an area from its determinant. Uploading bare k_stiff
+				// therefore made AVBD's membrane too stiff by 1/area_rest
+				// (~57x on a 0.1875-spaced mesh), which pinned the solve
+				// near x_n and left AVBD moving ~5.5x less per step than
+				// PD. Upload PD's effective weight instead.
+				// AVBD_RAW_STIFFNESS=1 restores the old behaviour for A/B.
+				const bool s_avbdRawStiff = avbdCfg().rawStiffness;
 				float maxAbsInvUV = 0.0f;
 				uint32_t maxTri = 0;
 				for (uint32_t i = 0; i < nT; ++i) {
+					if (!s_avbdRawStiff) {
+						const double w = mesh[i].constrainWeightSqrt;
+						triK[i] = float(w * w);  // == k_stiff * area_rest
+					}
 					triIdx[3*i + 0] = uint32_t(mesh[i].p0_idx);
 					triIdx[3*i + 1] = uint32_t(mesh[i].p1_idx);
 					triIdx[3*i + 2] = uint32_t(mesh[i].p2_idx);
@@ -4199,7 +4314,7 @@ void Simulation::initializePrefactoredMatrices() {
 				// (PR-G follow-up: if disabling bending closes the
 				// PD-vs-AVBD gap, bending has a kernel bug; if not,
 				// the gap is in membrane or per-vertex GS coupling).
-				const bool s_avbdNoBending = (std::getenv("AVBD_NO_BENDING") != nullptr);
+				const bool s_avbdNoBending = !avbdCfg().bending;
 				const uint32_t nB = s_avbdNoBending
 				    ? 0u
 				    : uint32_t(bendingConstraints.size());
@@ -4210,8 +4325,17 @@ void Simulation::initializePrefactoredMatrices() {
 				std::vector<float>    bendWeight(4 * nB);
 				std::vector<float>    bendNTarget(nB);
 				std::vector<float>    bendK(nB, float(TriangleBending::k_stiff));
+				// Same dimensional fix as the membrane upload, in the
+				// opposite direction: PD's bending weight is
+				// `k_stiff * 3/(A0+A1)` (TriangleBending.h:62), which
+				// DIVIDES by area, so bare k_stiff left AVBD's bending
+				// too soft by ~3/(A0+A1) (~85x on this mesh).
 				for (uint32_t i = 0; i < nB; ++i) {
 					auto &b = bendingConstraints[i];
+					if (!s_avbdRawStiff) {
+						const double w = b.constrainWeightSqrt;
+						bendK[i] = float(w * w);  // == k_stiff * 3/(A0+A1)
+					}
 					bendIdx[4*i + 0] = uint32_t(b.p0_idx);
 					bendIdx[4*i + 1] = uint32_t(b.p1_idx);
 					bendIdx[4*i + 2] = uint32_t(b.p2_idx);
@@ -4226,10 +4350,10 @@ void Simulation::initializePrefactoredMatrices() {
 				// AVBD_AL_GAMMA scales the AL γ down from its default
 				// (= stiffness, ~1e4 on dress, way too aggressive per
 				// PR #83 finding). Reasonable values: 0.001 to 0.1.
-				if (const char* gstr = std::getenv("AVBD_AL_GAMMA")) {
-					const float gscale = float(std::atof(gstr));
+				if (avbdCfg().alGammaSet) {
+					const float gscale = avbdCfg().alGamma;
 					avbd->setGammaScale(gscale);
-					std::printf("[avbd] γ scaled by %g (AVBD_AL_GAMMA env)\n", gscale);
+					std::printf("[avbd] γ scaled by %g\n", gscale);
 				}
 
 				// Build greedy first-fit vertex coloring by default —
@@ -4238,7 +4362,7 @@ void Simulation::initializePrefactoredMatrices() {
 				// block Jacobi (numColors=1 + identity perm — for
 				// debugging only; that's what's been shown to diverge
 				// on stiff meshes in #90).
-				if (std::getenv("AVBD_NO_COLORS") == nullptr) {
+				if (avbdCfg().colors) {
 					avbd->buildColoring();
 				}
 
@@ -4263,7 +4387,7 @@ void Simulation::initializePrefactoredMatrices() {
 				             "USE_AVBD=1 will be ignored\n");
 			}
 		}
-#endif
+#endif  // CLOTH_HAVE_GPU_AVBD
 
 		if (runBackward) {
 			MatXd dp_dfixedpos = MatXd(sysMat[sysMatId].constraintNum,
@@ -5204,7 +5328,7 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 	// AVBD shim is stateless (does not take a `gradient_new`
 	// accumulator like the PD path does). Requires that the forward
 	// was driven by AVBD (`sysMat[0].avbd` set up).
-	const bool useAvbdBwd = (std::getenv("USE_AVBD_BWD") != nullptr) &&
+	const bool useAvbdBwd = avbdCfg().useAvbdBwd &&
 			!sysMat.empty() && sysMat[0].avbd && sysMat[0].avbd->ok();
 	// CHI-111: truncated BPTT. Cap the chain to the K most-recent
 	// timesteps to bound the BPTT amplification. The AVBD per-step
@@ -5217,9 +5341,7 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 	// (~5-10 timestep response time for stiff materials at h=10ms).
 	// Set AVBD_BWD_TRUNCATE_K=0 to disable truncation (full chain).
 	int avbdBwdTruncateK = 20;
-	if (const char *e = std::getenv("AVBD_BWD_TRUNCATE_K")) {
-		avbdBwdTruncateK = std::atoi(e);
-	}
+	avbdBwdTruncateK = avbdCfg().bwdTruncateK;
 	// CHI-111: IFT-style adjoint. AVBD_BWD_IFT=1 disables BPTT entirely;
 	// each timestep's parameter gradient is computed as an independent
 	// IFT solve at that step's converged state. Per-vertex H from
@@ -5230,7 +5352,7 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 	// forward step actually reaches equilibrium. Per CHI-99 finding 4,
 	// AVBD's per-vertex GS reaches static drape equilibrium in ~16
 	// iters; below that, the H is not a faithful IFT Jacobian.
-	const bool useAvbdIft = std::getenv("AVBD_BWD_IFT") != nullptr;
+	const bool useAvbdIft = avbdCfg().bwdIft;
 	if (useAvbdBwd) {
 		std::printf("[avbd-bwd] USE_AVBD_BWD=1 — routing backward through "
 					"Simulation::stepBackwardAvbd (truncate K=%d, IFT=%d)\n",
