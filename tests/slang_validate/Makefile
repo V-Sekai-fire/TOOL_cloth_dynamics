@@ -17,15 +17,41 @@
 # The bin/slangc wrapper is a shim that exec's bin/.slang/bin/slangc.
 
 REPO_ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
-SLANGC     := $(REPO_ROOT)/bin/slangc
+# Prefer the project-local toolchain under bin/.slang (installed by
+# misc/install-slang.sh). If it is absent — e.g. on Windows, where
+# install-slang.sh has no platform arm — fall back to a slangc on PATH,
+# which the Vulkan SDK provides.
+SLANGC     := $(if $(wildcard $(REPO_ROOT)/bin/.slang/bin/slangc*),$(REPO_ROOT)/bin/slangc,slangc)
 SLANG_DIR  := $(REPO_ROOT)/bin/.slang
 EMITTED    := $(CURDIR)/build
 LEAN_DIR   := $(REPO_ROOT)/lean
+# Where `lake exe emit_shaders` drops the generated .slang sources.
+# Overridable so this works outside a POSIX /tmp (PowerShell, CI).
+SHADER_SRC ?= /tmp/emitted_shaders
 
 # Metal kernels we benchmark on real GPU (Tier-3 perf). The full slang →
 # air → metallib pipeline runs once per kernel listed here.
 METAL_KERNELS := spring_project saxpby spmv dot_reduce_serial dot_reduce assemble_b cg_alpha cg_beta saxpby_indirect spmv_df32 saxpby_indirect_df32 spring_force vbd_init vbd_solve_apply vbd_gather_spring vbd_gather_attachment vbd_gather_triangle vbd_gather_bending attachment_force_al attachment_dual_update triangle_membrane_force_al triangle_membrane_dual_update triangle_bending_force_al triangle_bending_dual_update self_collision_scan vbd_solve_apply_backward vbd_init_backward vbd_gather_triangle_backward vbd_gather_attachment_backward vbd_gather_bending_backward vbd_gather_spring_backward attachment_force_al_backward spring_force_backward triangle_bending_force_al_backward triangle_membrane_force_al_backward
 METALLIBS     := $(addprefix $(EMITTED)/,$(addsuffix .metallib,$(METAL_KERNELS)))
+
+# AVBD kernels dispatched by the Vulkan backend (src/code/slang_solver/
+# AvbdSolverVk.cpp). Forward + augmented-Lagrangian duals + the adjoint
+# set. Unlike Metal's slang -> .metal -> .air -> .metallib chain, SPIR-V
+# is a single hop, so .spv is the terminal artifact.
+AVBD_KERNELS := \
+  vbd_init vbd_solve_apply \
+  vbd_gather_spring vbd_gather_attachment vbd_gather_triangle vbd_gather_bending \
+  spring_force attachment_force_al triangle_membrane_force_al triangle_bending_force_al \
+  attachment_dual_update triangle_membrane_dual_update triangle_bending_dual_update \
+  self_collision_scan \
+  vbd_init_backward vbd_solve_apply_backward \
+  vbd_gather_spring_backward vbd_gather_attachment_backward \
+  vbd_gather_triangle_backward vbd_gather_bending_backward \
+  spring_force_backward attachment_force_al_backward \
+  triangle_membrane_force_al_backward triangle_bending_force_al_backward
+
+SPIRV_MODULES := $(addprefix $(EMITTED)/,$(addsuffix .spv,$(AVBD_KERNELS)))
+SPIRV_REFL    := $(addprefix $(EMITTED)/,$(addsuffix .refl.json,$(AVBD_KERNELS)))
 
 CXX        ?= clang++
 # -Wno-unused-parameter silences clang's complaint about
@@ -80,7 +106,7 @@ BINS       := $(addprefix $(EMITTED)/,$(addsuffix _test,$(TEST_NAMES))) \
               $(EMITTED)/perf_baseline_test \
               $(EMITTED)/metal_perf_test
 
-.PHONY: test clean emit-shaders
+.PHONY: test clean emit-shaders spirv avbd-table
 
 test: $(BINS)
 	@fails=0; \
@@ -92,13 +118,13 @@ test: $(BINS)
 
 # Make sure the .slang files exist before we ask slangc for cpp output.
 emit-shaders:
-	@cd $(LEAN_DIR) && lake exe emit_shaders /tmp/emitted_shaders >/dev/null
+	@cd $(LEAN_DIR) && lake exe emit_shaders $(SHADER_SRC) >/dev/null
 
 # slang → cpp source.
 $(EMITTED)/%_emit.cpp: emit-shaders
 	@mkdir -p $(EMITTED)
 	$(SLANGC) -target cpp -stage compute -entry main \
-	  -o $@ /tmp/emitted_shaders/$*.slang
+	  -o $@ $(SHADER_SRC)/$*.slang
 
 # Per-test build rule. Each test_name maps to a kernel_name via the
 # TESTS list; the test source #include's its kernel's emit.
@@ -204,7 +230,7 @@ $(EMITTED)/perf_baseline_test: perf_baseline_test.cpp \
 $(EMITTED)/%.metal: emit-shaders
 	@mkdir -p $(EMITTED)
 	$(SLANGC) -target metal -stage compute -entry main \
-	  -o $@ /tmp/emitted_shaders/$*.slang
+	  -o $@ $(SHADER_SRC)/$*.slang
 
 $(EMITTED)/%.air: $(EMITTED)/%.metal
 	xcrun -sdk macosx metal -c $< -o $@
@@ -218,6 +244,36 @@ $(EMITTED)/metal_perf_test: metal_perf_test.mm $(METALLIBS)
 	$(CXX) -std=c++17 -O2 -fobjc-arc -Wall -Wextra \
 	  -framework Metal -framework Foundation \
 	  -o $@ $<
+
+# ---- Vulkan / SPIR-V --------------------------------------------------
+# slang -> .spv in one hop (no xcrun, so this is the portable target).
+# The companion .refl.json carries each kernel's descriptor bindings,
+# resource kinds and threadgroup size; gen_avbd_kernel_table.py turns
+# those into the dispatcher table so it cannot drift from the Lean
+# codegen. `-profile sm_6_5` matches the CI round-trip in
+# .github/workflows/lean-slang.yml.
+
+$(EMITTED)/%.spv: emit-shaders
+	@mkdir -p $(EMITTED)
+	$(SLANGC) -target spirv -profile sm_6_5 -stage compute -entry main \
+	  -o $@ $(SHADER_SRC)/$*.slang
+
+$(EMITTED)/%.refl.json: emit-shaders
+	@mkdir -p $(EMITTED)
+	$(SLANGC) -target spirv -profile sm_6_5 -stage compute -entry main \
+	  -reflection-json $@ -o $(EMITTED)/$*.spv $(SHADER_SRC)/$*.slang
+
+spirv: $(SPIRV_MODULES) $(SPIRV_REFL)
+	@echo "SPIR-V: $(words $(AVBD_KERNELS)) AVBD kernels in $(EMITTED)"
+
+# Dispatcher binding table, generated from the reflection JSON.
+AVBD_TABLE := $(REPO_ROOT)/src/code/slang_solver/AvbdKernelTable.inc
+
+$(AVBD_TABLE): $(SPIRV_REFL) gen_avbd_kernel_table.py
+	python gen_avbd_kernel_table.py --build-dir $(EMITTED) --out $@ \
+	  $(AVBD_KERNELS)
+
+avbd-table: $(AVBD_TABLE)
 
 clean:
 	rm -rf $(EMITTED)
