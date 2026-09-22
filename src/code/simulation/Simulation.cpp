@@ -1780,7 +1780,18 @@ void Simulation::step() {
 		    avbdCfg().drive;
 		const bool avbdWillDrive = s_avbdDriveEnv && g_useAvbd &&
 		    currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok();
-		const bool runPDLoop = pdForwardActive() || !avbdWillDrive;
+		// PD's adjoint reads per-type A_t*p out of the forward record
+		// (At_p_weightless_pertype, written below under
+		// calcualteSeperateAt_p). Skipping PD's forward loop left that
+		// field default-constructed -- size 0 with a null data pointer --
+		// and stepBackward then stored through it, which is the dress
+		// demo's crash. Keep PD's forward alive exactly when PD's
+		// adjoint is the one that will run and will read that field;
+		// with USE_AVBD_BWD the AVBD adjoint never touches it, so the
+		// skip stays valid and the speed win is preserved.
+		const bool pdBackwardNeedsAtP = calcualteSeperateAt_p && !avbdCfg().useAvbdBwd;
+		const bool runPDLoop =
+		    pdForwardActive() || !avbdWillDrive || pdBackwardNeedsAtP;
 #else
 		const bool runPDLoop = true;
 #endif
@@ -2613,6 +2624,28 @@ Simulation::stepBackward(Simulation::BackwardTaskInformation &taskInfo,
 
 	for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
 		if (taskInfo.dL_dk_pertype[i]) {
+			// A default-constructed VecXd is size 0 with a null data
+			// pointer, and Eigen will happily accept it as an operand:
+			// the failure surfaces much later as a size assertion, or
+			// in a build without assertions as a null store inside the
+			// vectorized assignment loop. Say what is actually wrong.
+			//
+			// This field is only written when PD's forward loop runs
+			// (runPDLoop, Simulation.cpp:1783). When AVBD drives and
+			// PD's forward is skipped, it is never populated -- so
+			// PD's adjoint cannot be used on an AVBD-driven forward
+			// that also asks for per-type stiffness gradients.
+			if (forwardInfo_new.At_p_weightless_pertype[i].size() == 0) {
+				Logging::logColor(
+						"[backward] At_p_weightless_pertype[" + std::to_string(i) +
+								"] is empty: PD's adjoint needs per-type A_t*p, which "
+								"is only computed when PD's forward loop runs. The "
+								"forward was driven by AVBD with PD's loop skipped. "
+								"Use USE_AVBD_BWD=1 (AVBD adjoint), USE_PD=1 (all PD), "
+								"or AVBD_NO_SKIP_PD=1 (keep PD's forward state).\n",
+						Logging::LogColor::RED);
+				continue;
+			}
 			VecXd dA_t_times_p_dk = forwardInfo_new.At_p_weightless_pertype[i];
 			VecXd A_t_A_weightless_times_xnew =
 					currentSysMat.A_t_times_A_pertype[i] * x_new;
