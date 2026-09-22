@@ -93,6 +93,10 @@ private def loopBody : List SlangStmt :=
 
 private def body : List SlangStmt :=
   [ .declInit u  "lane"   (.member (.var "tid") "x")
+  , .ifThen
+      (.bin ">=" (.var "lane") (.member (.var "params") "count"))
+      [ .ret none ]
+      []
   , .declInit u  "v"
       (.index (.var "vertPerm")
         (.bin "+" (.var "lane")
@@ -125,7 +129,8 @@ private def body : List SlangStmt :=
 def shader : SlangShaderModule :=
   { structs :=
       [ { name := "VbdGatherSpringParams"
-        , fields := [⟨"colorOffset", u, Semantic.none, none, none, .qIn⟩] } ]
+        , fields := [⟨"colorOffset", u, Semantic.none, none, none, .qIn⟩
+            , ⟨"count", u, Semantic.none, none, none, .qIn⟩ ] } ]
   , globals :=
       [ bnd 0 "springGradA"      (.roBuf f3)
       , bnd 1 "springHess"       (.roBuf f)
@@ -148,7 +153,7 @@ def shader : SlangShaderModule :=
 
 def expected : String :=
 "struct VbdGatherSpringParams {
-  uint colorOffset;
+  uint colorOffset;\n  uint count;
 };
 
 [[vk::binding(0, 0)]]
@@ -173,6 +178,9 @@ ConstantBuffer<VbdGatherSpringParams> params;
 [shader(\"compute\")] [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
   uint lane = tid.x;
+  if ((lane >= params.count)) {
+    return;
+  }
   uint v = vertPerm[(lane + params.colorOffset)];
   uint sStart = vertSpringOffset[v];
   uint sEnd = vertSpringOffset[(v + 1u)];

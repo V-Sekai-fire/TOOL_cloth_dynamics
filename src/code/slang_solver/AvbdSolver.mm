@@ -42,6 +42,11 @@ struct SelfCollisionScanParams {
 // bit-equivalent to the pre-coloring version.
 struct VbdSolveApplyParams {
     uint32_t colorOffset;
+    // Bounds for the kernel's tid guard. Metal's dispatchThreads: does
+    // not over-dispatch, so this is always the exact colour size here;
+    // the field exists because the kernel is shared with the Vulkan
+    // backend, where vkCmdDispatch rounds up to whole workgroups.
+    uint32_t count;
 };
 
 // Matches the VbdInitBackwardParams struct emitted by
@@ -1000,7 +1005,7 @@ int AvbdSolver::step() {
         [enc setBuffer:impl_->bufPositions offset:0 atIndex:2];
         [enc setBuffer:impl_->bufVertPerm  offset:0 atIndex:3];
         {
-            VbdSolveApplyParams sp{offset};
+            VbdSolveApplyParams sp{offset, count};
             [enc setBytes:&sp length:sizeof(sp) atIndex:4];
         }
         [enc dispatchThreads:MTLSizeMake(count, 1, 1)

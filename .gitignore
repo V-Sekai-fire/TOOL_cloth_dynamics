@@ -40,3 +40,6 @@ build_diffcloth/
 
 # Out-of-tree build dirs
 build-*/
+
+# Stray output dir if emit_shaders is handed a Windows path
+lean/Users*

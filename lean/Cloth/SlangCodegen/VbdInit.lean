@@ -49,6 +49,10 @@ private def f  : SlangType := .scalar .float
 
 private def body : List SlangStmt :=
   [ .declInit u  "lane" (.member (.var "tid") "x")
+  , .ifThen
+      (.bin ">=" (.var "lane") (.member (.var "params") "count"))
+      [ .ret none ]
+      []
   , .declInit u  "v"
       (.index (.var "vertPerm")
         (.bin "+" (.var "lane")
@@ -85,7 +89,8 @@ def shader : SlangShaderModule :=
       [ { name := "VbdInitParams"
         , fields :=
             [ ⟨"invHSquared", f, Semantic.none, none, none, .qIn⟩
-            , ⟨"colorOffset", u, Semantic.none, none, none, .qIn⟩ ] } ]
+            , ⟨"colorOffset", u, Semantic.none, none, none, .qIn⟩ 
+            , ⟨"count", u, Semantic.none, none, none, .qIn⟩ ] } ]
   , globals :=
       [ ⟨"params",    .const "VbdInitParams", Semantic.none, some 0, some 0, .qIn⟩
       , ⟨"positions", .roBuf f3,              Semantic.none, some 1, some 0, .qIn⟩
@@ -107,6 +112,7 @@ def expected : String :=
 "struct VbdInitParams {
   float invHSquared;
   uint colorOffset;
+  uint count;
 };
 
 [[vk::binding(0, 0)]]
@@ -127,6 +133,9 @@ StructuredBuffer<uint> vertPerm;
 [shader(\"compute\")] [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
   uint lane = tid.x;
+  if ((lane >= params.count)) {
+    return;
+  }
   uint v = vertPerm[(lane + params.colorOffset)];
   float3 x = positions[v];
   float3 px = predicted[v];

@@ -58,6 +58,10 @@ private def f  : SlangType := .scalar .float
 
 private def body : List SlangStmt :=
   [ .declInit u  "lane" (.member (.var "tid") "x")
+  , .ifThen
+      (.bin ">=" (.var "lane") (.member (.var "params") "count"))
+      [ .ret none ]
+      []
   , .declInit u  "v"
       (.index (.var "vertPerm")
         (.bin "+" (.var "lane")
@@ -130,7 +134,8 @@ private def bnd (n : Nat) (name : String) (t : SlangType) : SlangBinding :=
 def shader : SlangShaderModule :=
   { structs :=
       [ { name := "VbdSolveApplyParams"
-        , fields := [⟨"colorOffset", u, Semantic.none, none, none, .qIn⟩] } ]
+        , fields := [ ⟨"colorOffset", u, Semantic.none, none, none, .qIn⟩
+                    , ⟨"count",       u, Semantic.none, none, none, .qIn⟩ ] } ]
   , globals :=
       [ ⟨"gScratch",  .roBuf f3,                Semantic.none, some 0, some 0, .qIn⟩
       , ⟨"hScratch",  .roBuf f,                 Semantic.none, some 1, some 0, .qIn⟩
@@ -150,6 +155,7 @@ def shader : SlangShaderModule :=
 def expected : String :=
 "struct VbdSolveApplyParams {
   uint colorOffset;
+  uint count;
 };
 
 [[vk::binding(0, 0)]]
@@ -166,6 +172,9 @@ ConstantBuffer<VbdSolveApplyParams> params;
 [shader(\"compute\")] [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
   uint lane = tid.x;
+  if ((lane >= params.count)) {
+    return;
+  }
   uint v = vertPerm[(lane + params.colorOffset)];
   uint hb = (6u * v);
   float3 g = gScratch[v];

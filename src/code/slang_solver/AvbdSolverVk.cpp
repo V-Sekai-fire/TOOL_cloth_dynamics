@@ -793,6 +793,10 @@ struct VbdGatherParams {
 };
 struct VbdSolveApplyParams {
 	uint32_t colorOffset;
+	// Bounds for the kernel's own tid guard. vkCmdDispatch rounds up to
+	// whole workgroups, so the kernel needs to know where the colour's
+	// range actually ends.
+	uint32_t count;
 };
 struct SelfCollisionScanParams {
 	uint32_t nVerts;
@@ -906,7 +910,15 @@ void AvbdSolver::Impl::buildVertexColoringIfNeeded() {
 	}
 	const uint32_t permLen = std::max(cursor, kThreadsPerGroup);
 
-	std::vector<uint32_t> perm(permLen, nVerts);  // sentinel fill
+	// AVBD_VK_NO_PADDING=1 fills the colour tail with vertex 0 instead
+	// of the sentinel. That is the exact corruption the padding exists
+	// to prevent -- an overrun lane then addresses a REAL vertex. It is
+	// a falsifiability switch: with the kernels' own `lane >= count`
+	// guard in place the tail lanes return before touching vertPerm, so
+	// results must be unchanged; without the guard this reproduces the
+	// 324-component drift the colored conformance test reports.
+	const bool noPad = (std::getenv("AVBD_VK_NO_PADDING") != nullptr);
+	std::vector<uint32_t> perm(permLen, noPad ? 0u : nVerts);
 	std::vector<uint32_t> fill(nc, 0u);
 	for (uint32_t v = 0; v < nVerts; ++v) {
 		const uint32_t c = color[v];
@@ -1262,7 +1274,7 @@ int AvbdSolver::step() {
 			if (!d.dispatch(cmd, "vbd_gather_bending", count, &gp, sizeof(gp))) return -1;
 		}
 
-		const VbdSolveApplyParams sp{offset};
+		const VbdSolveApplyParams sp{offset, count};
 		if (!d.dispatch(cmd, "vbd_solve_apply", count, &sp, sizeof(sp))) return -1;
 	}
 
