@@ -7,17 +7,18 @@
 // return the identical value. So the suspect is the chain, not the
 // derivative.
 //
-// Simulation.cpp's own note says the per-step Jacobian has spectral
-// radius ~sqrt(2), so 125 steps amplify ~2^200x; AVBD_BWD_TRUNCATE_K=20
-// clips the chain to bound that, which makes the result a degree-20
-// Neumann approximation rather than the gradient. Nobody has measured
-// what that costs.
+// The standing explanation was BPTT amplification: Simulation.cpp notes
+// the per-step Jacobian has spectral radius ~sqrt(2), so 125 steps
+// amplify ~2^200x, and AVBD_BWD_TRUNCATE_K=20 clips the chain to bound
+// it. THAT EXPLANATION IS WRONG, and this test is what refuted it --
+// the chain breaks at N = 2, where sqrt(2)^2 = 2 and there is no
+// amplification to speak of. A 75% error at two steps is a broken
+// composition, not a magnified good one, and truncating at K=20 cannot
+// rescue something already wrong at K=2.
 //
-// This measures it on 4 vertices instead of 3634, by sweeping the
-// number of chained steps N and comparing the accumulated analytic
-// gradient against a finite difference of the N-step loss. Seconds per
-// sweep. The step count at which the relative error crosses out of
-// usefulness is the answer to "can PD's adjoint be retired".
+// The one-step STATE check below then localised it further: the fault
+// is `readPredictedGrad`, which does not return dL/d predicted. See
+// AvbdSolver.h's comment on that accessor.
 //
 // The predictor here is deliberately x_pred = x_prev (quasi-static, no
 // velocity term), so the chain is exactly N applications of the
@@ -227,9 +228,9 @@ int main(int argc, char **argv) {
 	if (firstBad) {
 		std::printf("test_avbd_chaincheck: the chained gradient departs from finite\n"
 					"differences by N = %d steps. The per-step adjoint is correct\n"
-					"(test_avbd_gradcheck), so this is the accumulation itself --\n"
-					"which is what AVBD_BWD_TRUNCATE_K is papering over, and what\n"
-					"has to be fixed before PD's adjoint can be retired.\n",
+					"(test_avbd_gradcheck), so the fault is in composing steps --\n"
+					"and at N = 2 there is no BPTT amplification to blame. The\n"
+					"state check above localises it to readPredictedGrad.\n",
 				firstBad);
 		return 0;  // a measurement, not a pass/fail gate
 	}

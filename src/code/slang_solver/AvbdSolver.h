@@ -252,11 +252,30 @@ public:
     // forward, so this is the full density / mass gradient. Vector of
     // length `nVerts`. Empty if backward not run.
     void readMassGrad(std::vector<float>& mass_grad) const;
-    // Per-vertex ∂L/∂predicted — emitted by `vbd_init_backward` (CHI-113).
-    // The predictor `s_n = x_prev + h·v_prev + h²·M⁻¹·f_ext` is the only
-    // place f_ext / wind force flow through the AVBD forward, so this
-    // is the upstream cotangent for wind / external-force inverse
-    // design. Layout: xyz tightly packed; length `3*nVerts`.
+    // Emitted by `vbd_init_backward` (CHI-113). INTENDED to be the
+    // per-vertex ∂L/∂predicted: the predictor
+    // `s_n = x_prev + h·v_prev + h²·M⁻¹·f_ext` is the only place f_ext /
+    // wind flows through the AVBD forward, which would make this the
+    // upstream cotangent for wind / external-force inverse design.
+    //
+    // MEASURED NOT TO BE THAT. test_avbd_chaincheck.cpp finite-
+    // differences the one-step loss against the input positions: every
+    // component where this accessor returns ZERO matches through
+    // `readPositionsGrad` alone to ~1e-4, and every component where it
+    // returns non-zero disagrees with the finite difference under both
+    // `positionsGrad` and `positionsGrad + predictedGrad`. So
+    // `positionsGrad` is right and this value is some other quantity.
+    //
+    // The Metal buffer behind it is named `bufVPredictedJunk`. An
+    // earlier revision of this comment asserted that name was stale;
+    // the measurement says the NAME was accurate and the assertion was
+    // not. What `vbd_init_backward`'s `v_y` output actually represents
+    // is still open -- `vbd_init` computes g = w·(x − predicted) with
+    // w = m·invH², so ∂L/∂predicted should be −w·∂L/∂g, and a dropped
+    // sign or weight is the obvious suspect.
+    //
+    // DO NOT build a gradient on this until it is resolved. Layout:
+    // xyz tightly packed; length `3*nVerts`.
     void readPredictedGrad(std::vector<float>& predicted_grad) const;
     void readSpringGrad(std::vector<float>& restLen_grad,
                         std::vector<float>& stiff_grad) const;

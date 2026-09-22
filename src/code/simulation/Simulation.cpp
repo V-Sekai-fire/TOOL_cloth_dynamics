@@ -2872,10 +2872,27 @@ Simulation::BackwardInformation Simulation::stepBackwardAvbd(
 	//
 	//   dL/dv_{idx-1} = h * dL/d predicted_idx
 	//
-	// and g.dL_dpredicted is exactly that cotangent (CHI-113). This is
-	// what makes friction differentiable on the AVBD path at all --
-	// previously dL/dmu was identically zero, which is why the sphere
-	// demo could not move its only parameter.
+	// and g.dL_dpredicted was believed to be exactly that cotangent
+	// (CHI-113). Before this, dL/dmu was identically zero, which is why
+	// the sphere demo could not move its only parameter.
+	//
+	// CAVEAT, measured after this was written: readPredictedGrad does
+	// NOT return dL/d predicted. test_avbd_chaincheck.cpp finite-
+	// differences the one-step loss against the input positions and
+	// finds every component where that accessor is non-zero disagrees,
+	// while every component where it is zero matches through
+	// readPositionsGrad alone. See the comment on readPredictedGrad in
+	// AvbdSolver.h.
+	//
+	// So the chain below is built on a quantity that is not what it
+	// claims. It does move mu the right way on the sphere demo
+	// (0.53977 -> 0.387541 against a groundtruth of 0.300, tracking
+	// PD's own trajectory), but a merely correlated direction still
+	// descends and L-BFGS-B absorbs scale error, so that is weaker
+	// evidence than it looks. Re-derive this once the accessor is
+	// understood; the structure (d v_new / d mu = -v_tan_rel, chained
+	// through the predictor) is independent of that bug and should
+	// survive.
 	if (taskInfo.dL_dmu && forwardInfo_prev != nullptr &&
 			!g.dL_dpredicted.empty()) {
 		const double h = sceneConfig.timeStep;
