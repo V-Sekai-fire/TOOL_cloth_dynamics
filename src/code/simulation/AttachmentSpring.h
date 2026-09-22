@@ -98,6 +98,15 @@ public:
 
 	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
 			bool withWeight) override;
+
+	void addAvbdConstraint(AvbdAssembly &out) const override {
+		out.atVert.push_back(uint32_t(p1_idx));
+		const Vec3d fp = fixedPointPos();
+		out.atFixed.push_back(float(fp[0]));
+		out.atFixed.push_back(float(fp[1]));
+		out.atFixed.push_back(float(fp[2]));
+		out.atK.push_back(float(AttachmentSpring::k_stiff));
+	}
 };
 
 #endif // OMEGAENGINE_ATTACHMENTSPRING_H

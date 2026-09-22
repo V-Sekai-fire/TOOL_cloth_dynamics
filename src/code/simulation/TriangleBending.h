@@ -65,6 +65,21 @@ public:
 	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
 			bool withWeight) override;
 
+	void addAvbdConstraint(AvbdAssembly &out) const override {
+		if (!out.bending) return;  // AVBD_NO_BENDING=1
+		out.bendIdx.push_back(uint32_t(p0_idx));
+		out.bendIdx.push_back(uint32_t(p1_idx));
+		out.bendIdx.push_back(uint32_t(p2_idx));
+		out.bendIdx.push_back(uint32_t(p3_idx));
+		for (int r = 0; r < 4; ++r)
+			out.bendWeight.push_back(float(weightVert[r]));
+		out.bendNTarget.push_back(float(n));
+		// constrainWeightSqrt^2 == k_stiff * 3/(A0+A1).
+		out.bendK.push_back(out.rawStiffness
+				? float(TriangleBending::k_stiff)
+				: float(constrainWeightSqrt * constrainWeightSqrt));
+	}
+
 	VecXd project(const VecXd &x_vec) const override;
 
 	void projectBackward(const VecXd &x_vec, TripleVector &triplets) override;

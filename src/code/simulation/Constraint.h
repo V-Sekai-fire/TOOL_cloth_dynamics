@@ -31,6 +31,8 @@
 #ifndef OMEGAENGINE_CONSTRAINT_H
 #define OMEGAENGINE_CONSTRAINT_H
 
+#include "AvbdAssembly.h"
+
 #include "../engine/Macros.h"
 #include "../engine/UtilityFunctions.h"
 #include "Particle.h"
@@ -97,6 +99,18 @@ public:
 	virtual void addConstraint(std::vector<Triplet> &tri, int &c_idx,
 			bool withWeight = true) {
 		std::printf("WARNING\n");
+		assert(false);
+	}
+
+	// AVBD counterpart to addConstraint: append this constraint to the
+	// per-family arrays AvbdSolver::upload* consumes. See AvbdAssembly.h.
+	//
+	// Loud by default, like its siblings above. All four current
+	// constraint types implement it; a fifth that did not would
+	// otherwise be silently absent from the solver, which is the exact
+	// failure this protocol exists to prevent.
+	virtual void addAvbdConstraint(AvbdAssembly &out) const {
+		std::printf("WARNING: constraint type has no AVBD assembly\n");
 		assert(false);
 	}
 };

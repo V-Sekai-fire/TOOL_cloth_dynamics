@@ -101,6 +101,13 @@ public:
 
 	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
 			bool withWeight) override;
+
+	void addAvbdConstraint(AvbdAssembly &out) const override {
+		out.spP1.push_back(uint32_t(p1_idx));
+		out.spP2.push_back(uint32_t(p2_idx));
+		out.spRest.push_back(float(l0));
+		out.spK.push_back(float(k_s));
+	}
 };
 
 #endif // OMEGAENGINE_SPRING_H

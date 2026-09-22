@@ -180,6 +180,23 @@ public:
 	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
 			bool withWeight) override;
 
+	void addAvbdConstraint(AvbdAssembly &out) const override {
+		if (!out.membrane) return;  // AVBD_NO_MEMBRANE=1
+		out.triIdx.push_back(uint32_t(p0_idx));
+		out.triIdx.push_back(uint32_t(p1_idx));
+		out.triIdx.push_back(uint32_t(p2_idx));
+		// Row-major 2x2: [m00, m01, m10, m11].
+		out.triInvUV.push_back(float(inv_deltaUV(0, 0)));
+		out.triInvUV.push_back(float(inv_deltaUV(0, 1)));
+		out.triInvUV.push_back(float(inv_deltaUV(1, 0)));
+		out.triInvUV.push_back(float(inv_deltaUV(1, 1)));
+		// constrainWeightSqrt^2 == k_stiff * area_rest, the weight PD
+		// actually applies; see AvbdAssembly::rawStiffness.
+		out.triK.push_back(out.rawStiffness
+				? float(Triangle::k_stiff)
+				: float(constrainWeightSqrt * constrainWeightSqrt));
+	}
+
 	VecXd project(const VecXd &x_vec) const override;
 
 	void projectBackward(const VecXd &x_vec, TripleVector &triplets) override;

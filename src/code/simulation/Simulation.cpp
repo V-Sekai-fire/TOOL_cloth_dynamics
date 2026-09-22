@@ -29,6 +29,7 @@
 
 #include <map>
 #include "Simulation.h"
+#include "AvbdAssembly.h"
 
 #ifdef __APPLE__
 #endif
@@ -3694,145 +3695,39 @@ void Simulation::initializePrefactoredMatrices() {
 				avbd->setupMesh(nV, posF.data(), predF.data(),
 				                massF.data(), invHSq);
 
-				// Upload spring constraints. DiffCloth's `springs` vector
-				// holds endpoint indices + rest length + per-spring
-				// stiffness `k_s`. AvbdSolver computes the vertex→spring
-				// CSR adjacency internally.
-				const uint32_t nS = uint32_t(springs.size());
-				std::vector<uint32_t> spP1(nS), spP2(nS);
-				std::vector<float>    spL(nS), spK(nS);
-				for (uint32_t i = 0; i < nS; ++i) {
-					spP1[i] = uint32_t(springs[i].p1_idx);
-					spP2[i] = uint32_t(springs[i].p2_idx);
-					spL[i]  = float(springs[i].l0);
-					spK[i]  = float(springs[i].k_s);
-				}
-				avbd->uploadSprings(nS, spP1.data(), spP2.data(),
-				                    spL.data(), spK.data());
+				// Assemble every family from this sysMat's constraint list, the
+				// same list PD's addConstraint walks. Each constraint appends
+				// itself via Constraint::addAvbdConstraint; see AvbdAssembly.h for
+				// why this is not done by reaching into springs / mesh /
+				// bendingConstraints directly any more.
+				AvbdAssembly asmb;
+				asmb.rawStiffness = avbdCfg().rawStiffness;
+				asmb.membrane     = avbdCfg().membrane;
+				asmb.bending      = avbdCfg().bending;
+				for (Constraint *c : sysMat[sysMatId].constraints)
+					c->addAvbdConstraint(asmb);
 
-				// Upload triangle (membrane in-plane stretch) constraints.
-				// DiffCloth's `mesh` vector holds Triangle constraints
-				// with (p0, p1, p2). Stiffness is Triangle::k_stiff
-				// (shared static; per-triangle override is uncommon).
-				// Each Triangle stores `inv_deltaUV` (2x2 rest material
-				// matrix inverse) used to map raw 3D edges into the 2D
-				// material plane: F = [p1-p0 | p2-p0] · inv_deltaUV.
-				// AVBD's membrane kernel needs this — without it every
-				// triangle is treated as canonical/equilateral rest,
-				// pulling the mesh toward an unphysical equilibrium.
-				const bool s_avbdNoMembrane = !avbdCfg().membrane;
-				const uint32_t nT = s_avbdNoMembrane ? 0u : uint32_t(mesh.size());
-				if (s_avbdNoMembrane)
-					std::printf("[avbd] AVBD_NO_MEMBRANE=1: skipping %zu triangle uploads\n",
-					            mesh.size());
-				std::vector<uint32_t> triIdx(3 * nT);
-				std::vector<float>    triInvUV(4 * nT);
-				std::vector<float>    triK(nT, float(Triangle::k_stiff));
-				// Dimensional fix: PD weights the membrane energy by
-				// `k_stiff * area_rest` everywhere (Triangle.cpp:54, 90,
-				// 169; constrainWeightSqrt = sqrt(area_rest * k_stiff)),
-				// but the Slang kernel consumes `stiffness[c]` raw --
-				// it uses inv_deltaUV only to build F and never recovers
-				// an area from its determinant. Uploading bare k_stiff
-				// therefore made AVBD's membrane too stiff by 1/area_rest
-				// (~57x on a 0.1875-spaced mesh), which pinned the solve
-				// near x_n and left AVBD moving ~5.5x less per step than
-				// PD. Upload PD's effective weight instead.
-				// AVBD_RAW_STIFFNESS=1 restores the old behaviour for A/B.
-				const bool s_avbdRawStiff = avbdCfg().rawStiffness;
-				float maxAbsInvUV = 0.0f;
-				uint32_t maxTri = 0;
-				for (uint32_t i = 0; i < nT; ++i) {
-					if (!s_avbdRawStiff) {
-						const double w = mesh[i].constrainWeightSqrt;
-						triK[i] = float(w * w);  // == k_stiff * area_rest
-					}
-					triIdx[3*i + 0] = uint32_t(mesh[i].p0_idx);
-					triIdx[3*i + 1] = uint32_t(mesh[i].p1_idx);
-					triIdx[3*i + 2] = uint32_t(mesh[i].p2_idx);
-					// Row-major 2x2: [m00, m01, m10, m11].
-					triInvUV[4*i + 0] = float(mesh[i].inv_deltaUV(0, 0));
-					triInvUV[4*i + 1] = float(mesh[i].inv_deltaUV(0, 1));
-					triInvUV[4*i + 2] = float(mesh[i].inv_deltaUV(1, 0));
-					triInvUV[4*i + 3] = float(mesh[i].inv_deltaUV(1, 1));
-					for (int j = 0; j < 4; ++j) {
-						const float a = std::fabs(triInvUV[4*i + j]);
-						if (a > maxAbsInvUV) { maxAbsInvUV = a; maxTri = i; }
-					}
-				}
-				if (nT > 0) {
-					std::printf("[avbd] inv_deltaUV range over %u tris: max |M|=%g "
-					            "at tri %u (verts %u,%u,%u; M=[%g,%g; %g,%g])\n",
-					            nT, maxAbsInvUV, maxTri,
-					            triIdx[3*maxTri+0], triIdx[3*maxTri+1], triIdx[3*maxTri+2],
-					            triInvUV[4*maxTri+0], triInvUV[4*maxTri+1],
-					            triInvUV[4*maxTri+2], triInvUV[4*maxTri+3]);
-					avbd->uploadTriangles(nT, triIdx.data(), triInvUV.data(),
-					                     triK.data());
-				}
+				if (!asmb.membrane)
+					std::printf("[avbd] AVBD_NO_MEMBRANE=1: %zu triangles skipped\n",
+							mesh.size());
+				if (!asmb.bending)
+					std::printf("[avbd] AVBD_NO_BENDING=1: %zu bendings skipped\n",
+							bendingConstraints.size());
 
-				// Upload attachment (point-pin) constraints from this
-				// sysMat's `attachments` vector. Each AttachmentSpring
-				// pins p1_idx to a world-space anchor (fixedPointPos)
-				// with stiffness AttachmentSpring::k_stiff.
-				const uint32_t nA = uint32_t(sysMat[sysMatId].attachments.size());
-				std::vector<uint32_t> atVert(nA);
-				std::vector<float>    atFixed(3 * nA);
-				std::vector<float>    atK(nA, float(AttachmentSpring::k_stiff));
-				for (uint32_t i = 0; i < nA; ++i) {
-					auto &a = sysMat[sysMatId].attachments[i];
-					atVert[i] = uint32_t(a.p1_idx);
-					Vec3d fp = a.fixedPointPos();
-					atFixed[3*i + 0] = float(fp[0]);
-					atFixed[3*i + 1] = float(fp[1]);
-					atFixed[3*i + 2] = float(fp[2]);
+				avbd->uploadSprings(asmb.nSprings(), asmb.spP1.data(), asmb.spP2.data(),
+						asmb.spRest.data(), asmb.spK.data());
+				avbd->uploadAttachments(asmb.nAttachments(), asmb.atVert.data(),
+						asmb.atFixed.data(), asmb.atK.data());
+				if (asmb.nTriangles() > 0) {
+					avbd->uploadTriangles(asmb.nTriangles(), asmb.triIdx.data(),
+							asmb.triInvUV.data(), asmb.triK.data());
 				}
-				avbd->uploadAttachments(nA, atVert.data(), atFixed.data(), atK.data());
-
-				// Upload dihedral bending constraints from
-				// DiffCloth's `bendingConstraints` vector. Each
-				// TriangleBending has a 4-vertex stencil (p0..p3)
-				// with cotangent Laplacian weights (Vec4d weightVert)
-				// and rest magnitude `n`. Stiffness uses
-				// TriangleBending::k_stiff.
-				// AVBD_NO_BENDING=1 uploads zero bending constraints —
-				// experimental switch to test whether bending kernel
-				// is the source of the persistent drift on the dress
-				// (PR-G follow-up: if disabling bending closes the
-				// PD-vs-AVBD gap, bending has a kernel bug; if not,
-				// the gap is in membrane or per-vertex GS coupling).
-				const bool s_avbdNoBending = !avbdCfg().bending;
-				const uint32_t nB = s_avbdNoBending
-				    ? 0u
-				    : uint32_t(bendingConstraints.size());
-				if (s_avbdNoBending)
-					std::printf("[avbd] AVBD_NO_BENDING=1: skipping %zu bending uploads\n",
-					            bendingConstraints.size());
-				std::vector<uint32_t> bendIdx(4 * nB);
-				std::vector<float>    bendWeight(4 * nB);
-				std::vector<float>    bendNTarget(nB);
-				std::vector<float>    bendK(nB, float(TriangleBending::k_stiff));
-				// Same dimensional fix as the membrane upload, in the
-				// opposite direction: PD's bending weight is
-				// `k_stiff * 3/(A0+A1)` (TriangleBending.h:62), which
-				// DIVIDES by area, so bare k_stiff left AVBD's bending
-				// too soft by ~3/(A0+A1) (~85x on this mesh).
-				for (uint32_t i = 0; i < nB; ++i) {
-					auto &b = bendingConstraints[i];
-					if (!s_avbdRawStiff) {
-						const double w = b.constrainWeightSqrt;
-						bendK[i] = float(w * w);  // == k_stiff * 3/(A0+A1)
-					}
-					bendIdx[4*i + 0] = uint32_t(b.p0_idx);
-					bendIdx[4*i + 1] = uint32_t(b.p1_idx);
-					bendIdx[4*i + 2] = uint32_t(b.p2_idx);
-					bendIdx[4*i + 3] = uint32_t(b.p3_idx);
-					for (int r = 0; r < 4; ++r)
-						bendWeight[4*i + r] = float(b.weightVert[r]);
-					bendNTarget[i] = float(b.n);
-				}
-				avbd->uploadBendings(nB, bendIdx.data(), bendWeight.data(),
-				                     bendNTarget.data(), bendK.data());
+				avbd->uploadBendings(asmb.nBendings(), asmb.bendIdx.data(),
+						asmb.bendWeight.data(), asmb.bendNTarget.data(), asmb.bendK.data());
+				std::printf("[avbd] assembled from %zu constraints: %u springs, "
+							"%u attachments, %u triangles, %u bendings\n",
+						sysMat[sysMatId].constraints.size(), asmb.nSprings(),
+						asmb.nAttachments(), asmb.nTriangles(), asmb.nBendings());
 
 				// AVBD_AL_GAMMA scales the AL γ down from its default
 				// (= stiffness, ~1e4 on dress, way too aggressive per
@@ -3867,7 +3762,8 @@ void Simulation::initializePrefactoredMatrices() {
 				sysMat[sysMatId].avbd = avbd;
 				std::printf("[avbd] AvbdSolver loaded + uploaded "
 				            "(nVerts=%u, nSprings=%u, nTri=%u, nAttach=%u, nBend=%u, h=%g, invH²=%g)\n",
-				            nV, nS, nT, nA, nB, h, invHSq);
+				            nV, asmb.nSprings(), asmb.nTriangles(),
+				            asmb.nAttachments(), asmb.nBendings(), h, invHSq);
 			} else {
 				std::fprintf(stderr,
 				             "[avbd] FAILED to construct AvbdSolver; "
