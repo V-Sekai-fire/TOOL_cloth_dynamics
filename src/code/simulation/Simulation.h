@@ -436,6 +436,35 @@ public:
 
 	std::vector<SystemMatrix> sysMat;
 
+	// Per-phase wall-clock accumulation for the forward step.
+	//
+	// The [bench] per-step line that preceded this was gated on
+	// BENCH_PER_STEP=1, which meant the PD dress control run recorded no
+	// timing at all and its cost had to be quoted from a different
+	// session. Accumulation here is unconditional -- a few integer adds
+	// per step -- so a summary is always available; only the per-step
+	// detail line stays opt-in.
+	struct PhaseTiming {
+		long long stepUs = 0;          // whole Simulation::step()
+		long long solveUs = 0;         // AVBD outer-iteration loop
+		long long contactUs = 0;       // cloth-vs-primitive projection
+		long long selfDetectUs = 0;    // self-collision detection
+		long long selfResolveUs = 0;   // self-collision resolution
+		int steps = 0;
+
+		void reset() { *this = PhaseTiming(); }
+
+		// Everything not attributed to a named phase.
+		long long otherUs() const {
+			const long long named =
+					solveUs + contactUs + selfDetectUs + selfResolveUs;
+			return stepUs > named ? stepUs - named : 0;
+		}
+		void report(const char *tag) const;
+	};
+	PhaseTiming phaseTiming;
+
+
 	static double *k_stiff_arr[Constraint::CONSTRAINT_NUM];
 
 	VecXd projections_pertype[Constraint::CONSTRAINT_NUM];

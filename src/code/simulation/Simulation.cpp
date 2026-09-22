@@ -1271,6 +1271,26 @@ void Simulation::stepNN(int idx, const VecXd &x, const VecXd &v,
 	step();
 	forwardRecords[forwardRecords.size() - 1].stepIdx = idx;
 }
+void Simulation::PhaseTiming::report(const char *tag) const {
+	if (steps <= 0) return;
+	const double n = double(steps);
+	const double ms = 1.0e-3;
+	std::printf("[phase-timing %s] %d steps, %.2f ms/step mean\n"
+				"    solve        %8.2f ms/step  %5.1f%%\n"
+				"    contact      %8.2f ms/step  %5.1f%%\n"
+				"    self-detect  %8.2f ms/step  %5.1f%%\n"
+				"    self-resolve %8.2f ms/step  %5.1f%%\n"
+				"    other        %8.2f ms/step  %5.1f%%\n"
+				"    total        %8.2f s\n",
+			tag, steps, stepUs * ms / n,
+			solveUs * ms / n, 100.0 * double(solveUs) / double(stepUs ? stepUs : 1),
+			contactUs * ms / n, 100.0 * double(contactUs) / double(stepUs ? stepUs : 1),
+			selfDetectUs * ms / n, 100.0 * double(selfDetectUs) / double(stepUs ? stepUs : 1),
+			selfResolveUs * ms / n, 100.0 * double(selfResolveUs) / double(stepUs ? stepUs : 1),
+			otherUs() * ms / n, 100.0 * double(otherUs()) / double(stepUs ? stepUs : 1),
+			double(stepUs) * 1.0e-6);
+}
+
 void Simulation::step() {
 	// [bench] Per-step wall clock, gated on env var BENCH_PER_STEP=1.
 	// Prints a one-liner at end of step() with total wall + which
@@ -1581,6 +1601,8 @@ void Simulation::step() {
 		const long long us =
 		    std::chrono::duration_cast<std::chrono::microseconds>(_avbd_t1 - _avbd_t0).count();
 
+		phaseTiming.solveUs += us;
+
 		std::vector<float> avbdPos;
 		sysMat[0].avbd->readPositions(avbdPos);
 		float dxMax = 0.0f, dxMean = 0.0f;
@@ -1871,10 +1893,11 @@ void Simulation::step() {
 		}
 	}
 
+
 	// [bench] one-line per-step wall, gated on BENCH_PER_STEP=1.
 	if (s_benchPerStep) {
-		auto _bench_us = std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::steady_clock::now() - _bench_t0).count();
+		const long long _bench_us = std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - _bench_t0).count();
 #ifdef CLOTH_HAVE_GPU_AVBD
 		// Pick the label for what actually drove the step:
 		//   AVBD_DRIVE + AVBD_SKIP_PD → AVBD's solve, no PD CG
@@ -1941,6 +1964,7 @@ void Simulation::step() {
 		// Default-on when DRIVE is set; AVBD_NO_CONTACT=1 disables.
 		// Self-collision (cloth-cloth) is a follow-up.
 		const bool s_avbdNoContact = !avbdCfg().contact;
+		const auto _contact_t0 = std::chrono::steady_clock::now();
 		if (!s_avbdNoContact) {
 			size_t projHits = 0;
 			size_t frictionHits = 0;
@@ -2016,6 +2040,8 @@ void Simulation::step() {
 				std::printf("[avbd-contact] step %zu projected %zu vert/primitive penetrations\n",
 				            forwardRecords.size(), projHits);
 		}
+		phaseTiming.contactUs += std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - _contact_t0).count();
 
 		// AVBD-side cloth-cloth self-collision resolution.
 		// Reuses the existing collisionDetection() spatial-hash with
@@ -2106,8 +2132,10 @@ void Simulation::step() {
 				resolvedTotal += passResolved;
 				if (passResolved == 0) break;  // settled
 			}
+			phaseTiming.selfDetectUs += detectUs;
+			phaseTiming.selfResolveUs += resolveUs;
 			if (resolvedTotal > 0)
-				std::printf("[avbd-selfcoll] step %zu resolved %zu  detect=%lld us  resolve=%lld us  path=%s\n",
+			std::printf("[avbd-selfcoll] step %zu resolved %zu  detect=%lld us  resolve=%lld us  path=%s\n",
 				            forwardRecords.size(), resolvedTotal,
 				            detectUs, resolveUs,
 				            s_avbdCpuSelf ? "cpu" : "gpu");
@@ -2156,6 +2184,14 @@ void Simulation::step() {
 			std::printf("\n");
 		}
 	}
+
+	// Whole-step wall, accumulated unconditionally at the END of step()
+	// so it actually covers contact and self-collision. An earlier
+	// placement alongside the [bench] line sat ~290 lines short of here
+	// and silently excluded both.
+	phaseTiming.stepUs += std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - _bench_t0).count();
+	++phaseTiming.steps;
 }
 
 // CHI-14 Brick D: AVBD-backed single-step adjoint.
@@ -4648,6 +4684,7 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 	std::printf("finished...\n");
 
 	std::printf("forward started...");
+	phaseTiming.reset();
 	if (!skipForward) {
 		for (int i = 0; i < FORWARD_STEPS; i++) {
 			if (i % 20 == 0) {
@@ -4658,6 +4695,7 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 		}
 	}
 	std::printf("finished...");
+	phaseTiming.report("forward");
 
 	if ((forwardRecords.empty())) {
 		std::printf("ERROR: NO RECORDS \n");
