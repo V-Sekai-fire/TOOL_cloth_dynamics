@@ -31,7 +31,6 @@
 #include "Simulation.h"
 
 #ifdef __APPLE__
-#include "../slang_solver/MetalCGSolver.h"
 #endif
 #ifdef CLOTH_HAVE_GPU_AVBD
 #include "../slang_solver/AvbdSolver.h"
@@ -41,24 +40,25 @@
 namespace {
     // Runtime selector. Set USE_SLANG_CG=1 in the environment to route
     // the LLT back-solve in step() through the Metal CG dispatcher.
-    bool g_useSlangCG = (std::getenv("USE_SLANG_CG") != nullptr);
 
-    // AVBD is now the default solver path on Apple Silicon. The
-    // dress runs at ~9 ms/step vs PD's ~7,960 ms — ~880× faster
-    // (PRs #87–#109). PD's Eigen-LLT + CG pipeline is retained as a
-    // legacy / debugging fallback, gated on USE_PD=1.
+    // AVBD is the only solver. PD's Eigen-LLT + CG pipeline has been
+    // removed: its forward loop, its adjoint, the A/C/P system matrices
+    // and every sparse factorization that fed them.
     //
-    // When AVBD is active the runtime path also enables coloring,
-    // drive (AVBD's output drives Particle.pos), skip-PD (PD's CG
-    // loop is short-circuited; LLT prefactorization too), and the
-    // primitive + self-collision post-step projections. Override
-    // each via:
-    //   USE_PD=1             — run PD instead of AVBD
-    //   AVBD_NO_COLORS=1     — fall back to block Jacobi
-    //   AVBD_NO_DRIVE=1      — shadow only (don't write back)
-    //   AVBD_NO_SKIP_PD=1    — also iterate PD's CG (waste)
-    //   AVBD_NO_CONTACT=1    — skip primitive projection
-    //   AVBD_NO_SELF_COLLISION=1 — skip cloth-cloth resolution
+    // The "~880x faster than PD" figure that stood here was never
+    // re-derived on this machine and is not repeated. What was actually
+    // measured is narrower: PD's dress forward cost 4028.71 ms/step, and
+    // a PD dress optimisation run did not finish a second L-BFGS
+    // iteration inside a 2400 s budget. AVBD completes the same demo.
+    // That is a real difference and it does not need a ratio invented
+    // for it.
+    //
+    // Remaining runtime overrides:
+    //   AVBD_NO_COLORS=1         - fall back to block Jacobi
+    //   AVBD_NO_DRIVE=1          - shadow only (now fatal: nothing else
+    //                              can drive the step)
+    //   AVBD_NO_CONTACT=1        - skip primitive projection
+    //   AVBD_NO_SELF_COLLISION=1 - skip cloth-cloth resolution
     // ------------------------------------------------------------------
     // AVBD configuration.
     //
@@ -73,7 +73,6 @@ namespace {
     // A/B work; the DEFAULTS are the supported configuration.
     // ------------------------------------------------------------------
     struct AvbdConfig {
-        bool usePD = false;          // USE_PD: run PD instead of AVBD
 
         // Solver. iters defaulted to 1 historically, which does NOT
         // converge: the AVBD/predictor drift is identical at 1 and 16
@@ -85,8 +84,7 @@ namespace {
         float damp       = 1.0f;     // AVBD_DAMP: velocity in predictor
         float relax      = 1.0f;     // AVBD_RELAX: <1 enables under-relax
         bool colors      = true;     // AVBD_NO_COLORS=1 -> block Jacobi
-        bool drive       = true;     // AVBD_NO_DRIVE=1  -> shadow only
-        bool skipPD      = true;     // AVBD_NO_SKIP_PD=1 -> also run PD CG
+        bool drive       = true;     // AVBD_NO_DRIVE=1 -> fatal, nothing drives
 
         // Constraints. rawStiffness restores the pre-fix uploads, which
         // dropped PD's area weighting and left the membrane ~57x too
@@ -107,21 +105,19 @@ namespace {
         int  selfPasses    = 2;      // AVBD_SELF_PASSES
         bool gpuSelf       = true;   // AVBD_GPU_SELF=0 -> CPU hash
 
-        // Adjoint.
-        bool useAvbdBwd  = false;    // USE_AVBD_BWD=1
+        // Adjoint. There is no longer a PD adjoint to choose between:
+        // AVBD's is the only one. USE_AVBD_BWD is gone with it.
         int  bwdTruncateK = 20;      // AVBD_BWD_TRUNCATE_K (0 = full)
         bool bwdIft      = false;    // AVBD_BWD_IFT=1
 
         static bool flagSet(const char *n) { return std::getenv(n) != nullptr; }
 
         void load() {
-            usePD = flagSet("USE_PD");
             if (const char *e = std::getenv("AVBD_ITERS")) iters = std::max(1, std::atoi(e));
             if (const char *e = std::getenv("AVBD_DAMP")) damp = float(std::atof(e));
             if (const char *e = std::getenv("AVBD_RELAX")) relax = float(std::atof(e));
             colors  = !flagSet("AVBD_NO_COLORS");
             drive   = !flagSet("AVBD_NO_DRIVE");
-            skipPD  = !flagSet("AVBD_NO_SKIP_PD");
             membrane = !flagSet("AVBD_NO_MEMBRANE");
             bending  = !flagSet("AVBD_NO_BENDING");
             rawStiffness = flagSet("AVBD_RAW_STIFFNESS");
@@ -137,7 +133,6 @@ namespace {
                 selfPasses = std::max(1, std::atoi(e));
             if (const char *e = std::getenv("AVBD_GPU_SELF"))
                 gpuSelf = (std::string(e) != "0");
-            useAvbdBwd = flagSet("USE_AVBD_BWD");
             if (const char *e = std::getenv("AVBD_BWD_TRUNCATE_K"))
                 bwdTruncateK = std::atoi(e);
             bwdIft = flagSet("AVBD_BWD_IFT");
@@ -146,15 +141,15 @@ namespace {
         void dump() const {
             std::printf(
                 "[avbd-config] solver=%s iters=%d damp=%g relax=%g colors=%d "
-                "drive=%d skipPD=%d | membrane=%d bending=%d rawStiffness=%d | "
+                "drive=%d | membrane=%d bending=%d rawStiffness=%d | "
                 "al=%d gamma=%s | contact=%d frictionPred=%d selfColl=%d "
                 "passes=%d gpuSelf=%d | bwd=%s truncateK=%d ift=%d\n",
-                usePD ? "PD" : "AVBD", iters, damp, relax, int(colors),
-                int(drive), int(skipPD), int(membrane), int(bending),
+                "AVBD", iters, damp, relax, int(colors),
+                int(drive), int(membrane), int(bending),
                 int(rawStiffness), int(al),
                 alGammaSet ? "set" : "default", int(contact),
                 int(frictionPred), int(selfCollision), selfPasses,
-                int(gpuSelf), useAvbdBwd ? "AVBD" : "PD", bwdTruncateK,
+                int(gpuSelf), "AVBD", bwdTruncateK,
                 int(bwdIft));
         }
     };
@@ -171,19 +166,13 @@ namespace {
         return cfg;
     }
 
-    bool g_usePD    = (std::getenv("USE_PD") != nullptr);
-    bool g_useAvbd  = !g_usePD;
+    // AVBD is the only solver. USE_PD, AVBD_NO_SKIP_PD and the
+    // g_usePD / g_useAvbd pair are gone with the PD forward loop.
 
-    // CHI-11 subtask 1: when AVBD will drive every step and the PD CG
-    // loop is short-circuited, the only per-step PD state that matters
-    // is what backward() reads. The forward-only PD kernels — Msolver
-    // factorization, M*s_n, P*x_n, the b vector — are pure waste. This
-    // gate skips them. AVBD_NO_SKIP_PD=1 re-enables the PD CG loop for
-    // shadow comparison; in that case PD keeps its full forward state.
-    bool pdForwardActive() {
-        if (g_usePD) return true;
-        return !avbdCfg().skipPD;
-    }
+    // AVBD is the only solver. What used to be here was a gate that
+    // skipped PD's forward-only kernels -- the Msolver factorization,
+    // M*s_n, P*x_n, the b vector -- while keeping PD alive for shadow
+    // comparison. There is no PD left to skip or compare against.
 
     // Where the compiled kernels live: .metallib on Apple, .spv under
     // Vulkan. Both backends are built into tests/slang_validate/build
@@ -231,7 +220,6 @@ volatile bool Simulation::enableConstantForcefield = false;
 
 volatile bool Simulation::windEnabled = false;
 double Simulation::forwardConvergenceThreshold = 1e-7;
-int Simulation::PD_TOTAL_ITER = 1000;
 double Simulation::backwardConvergenceThreshold = 1e-4 * 0.5;
 double Simulation::windNorm = 0.15;
 double Simulation::windFrequency = 14;
@@ -1375,13 +1363,11 @@ void Simulation::step() {
 	returnRecord.s_n = s_n;
 
 #ifdef CLOTH_HAVE_GPU_AVBD
-	// PR-E shadow shuttle: when USE_AVBD=1 and AvbdSolver is loaded,
-	// dispatch one full AVBD outer iteration in parallel with the PD
-	// path. The result is read back into a scratch buffer for logging;
-	// Particle.pos is NOT modified. Once we trust the shadow output
-	// matches PD, a follow-up PR flips the switch to actually drive
-	// the simulation from AVBD.
-	if (g_useAvbd && currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok()) {
+	// This block IS the forward step. It began life as a shadow path
+	// that ran one AVBD outer iteration alongside PD and only logged the
+	// result; it drives Particle.pos now, and there is no PD path left
+	// to run alongside.
+	if (currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok()) {
 		// AVBD_ITERS=N (default 16) controls how many AVBD outer
 		// iterations run per Simulation::step(). Real convergence
 		// needs ~4-50 iters depending on stiffness. The default was
@@ -1393,11 +1379,12 @@ void Simulation::step() {
 		// Tests the hypothesis that dress's per-vertex GS oscillation
 		// is kinetic-energy-driven (PR #84 finding). damp < 1.0 bleeds
 		// off velocity before the implicit Euler predictor is built.
-		// Affects ONLY the AVBD shadow path; PD's s_n is untouched.
+		// s_n itself is left alone; the damped predictor is built
+		// separately below.
 		const float s_avbdDamp = avbdCfg().damp;
 		const uint32_t nV = uint32_t(particles.size());
 		std::vector<float> posF(3 * nV), predF(3 * nV);
-		// PD's predictor s_n = x_n + h·v_n + h²·M_inv·f_ext. When
+		// The predictor s_n = x_n + h*v_n + h^2*M_inv*f_ext. When
 		// AVBD_DAMP < 1, build an "AVBD-only" predictor with damped
 		// velocity: s_n_avbd = x_n + h·damp·v_n + h²·M_inv·f_ext.
 		// At damp=1.0 this is identical to s_n.
@@ -1637,7 +1624,7 @@ void Simulation::step() {
 		// values relative to dxMax mean AVBD has settled — half the
 		// iters would have been enough. Large values mean more iters
 		// needed.
-		std::printf("[avbd-shadow] step %zu  dof=%u  iters=%d  rc=%d  wall=%lld us"
+		std::printf("[avbd-step] step %zu  dof=%u  iters=%d  rc=%d  wall=%lld us"
 		            "  |Δx|_max=%g  |Δx|_mean=%g  pred_max=%g  drift_max=%g"
 		            "  drift@v%u.%c  conv_max=%g  conv_mean=%g  nan=%d\n",
 		            forwardRecords.size(), nV * 3u, s_avbdIters, rc, us,
@@ -1773,297 +1760,44 @@ void Simulation::step() {
 		timeSteptimer.tic("PD init");
 
 		// CHI-11 subtask 1: decide whether PD's CG loop will actually
-		// iterate before allocating its working set. When AVBD drives
-		// every step (default on Apple Silicon), b / M*s_n / P*x_n are
-		// pure waste — the loop runs zero iterations and AVBD_DRIVE
-		// overwrites particles[i].{pos, velocity}. AVBD_NO_SKIP_PD=1
-		// or AVBD_NO_DRIVE=1 keeps PD active for shadow comparison.
+		// AVBD must be the one driving. There is no PD loop to fall
+		// back on and no shadow comparison to keep it alive for.
 #ifdef CLOTH_HAVE_GPU_AVBD
-		static const bool s_avbdDriveEnv =
-		    avbdCfg().drive;
-		const bool avbdWillDrive = s_avbdDriveEnv && g_useAvbd &&
+		static const bool s_avbdDriveEnv = avbdCfg().drive;
+		const bool avbdWillDrive = s_avbdDriveEnv &&
 		    currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok();
-		// PD's adjoint reads per-type A_t*p out of the forward record
-		// (At_p_weightless_pertype, written below under
-		// calcualteSeperateAt_p). Skipping PD's forward loop left that
-		// field default-constructed -- size 0 with a null data pointer --
-		// and stepBackward then stored through it, which is the dress
-		// demo's crash. Keep PD's forward alive exactly when PD's
-		// adjoint is the one that will run and will read that field;
-		// with USE_AVBD_BWD the AVBD adjoint never touches it, so the
-		// skip stays valid and the speed win is preserved.
-		const bool pdBackwardNeedsAtP = calcualteSeperateAt_p && !avbdCfg().useAvbdBwd;
-		const bool runPDLoop =
-		    pdForwardActive() || !avbdWillDrive || pdBackwardNeedsAtP;
+		// AVBD is the only forward solver now. If it is not available
+		// there is nothing to fall back to, so say so rather than
+		// silently producing whatever the uninitialised PD state held.
+		if (!avbdWillDrive) {
+			std::fprintf(stderr,
+					"[avbd] FATAL: the forward step requires the AVBD solver, and it "
+					"is not driving (sysMat empty, avbd null/not ok, or "
+					"AVBD_NO_DRIVE set). The PD forward loop has been removed.\n");
+			std::abort();
+		}
 #else
-		const bool runPDLoop = true;
+		std::fprintf(stderr, "[avbd] FATAL: built without CLOTH_HAVE_GPU_AVBD, and "
+							 "the PD forward loop has been removed.\n");
+		std::abort();
 #endif
 
 		Eigen::VectorXd b;
 		VecXd M_times_sn, P_times_xn;
 		double newEnergy = 0;
-		curEnergy = 1000000;
 		double min_xdiff = ((s_n - x_n).norm() * (1.0 / particles.size()));
 		int min_xdiffiter = 0;
 		VecXd x_new_lastconverging = x_n, v_new_lastconverging = v_n;
 
-		if (runPDLoop) {
-			b = Eigen::VectorXd::Zero(3 * particles.size());
-			M_times_sn = M * s_n;
-			P_times_xn = sysMat[currentSysmatId].P * x_n;
-			PD_TOTAL_ITER = (-std::log10(forwardConvergenceThreshold)) * 150;
-		} else {
-			x_new = s_n;
-			v_new = (s_n - x_n) / sceneConfig.timeStep;
-			PD_TOTAL_ITER = 0;
-		}
+		// The inertial prediction IS the forward result now; AVBD
+		// refines it below. PD used to build b, M*s_n and P*x_n here and
+		// then iterate on them.
+		x_new = s_n;
+		v_new = (s_n - x_n) / sceneConfig.timeStep;
+
 
 		timeSteptimer.toc();
 
-		for (int iterIdx = 0; iterIdx < PD_TOTAL_ITER; iterIdx++) {
-			timeSteptimer.tic("iter init");
-			std::pair<Eigen::VectorXd, Eigen::VectorXd> posVelVec =
-					getCurrentPosVelocityVec();
-			VecXd &v_now = posVelVec.second;
-			VecXd &x_now = posVelVec.first;
-			timeSteptimer.toc();
-
-			timeSteptimer.tic("projection");
-			projections.setZero();
-			for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-				projections_pertype[i].setZero();
-			}
-
-#pragma omp parallel for if (OPENMP_ENABLED)
-			for (int i = 0; i < sysMat[currentSysmatId].constraints.size(); i++) {
-				Constraint *c = sysMat[currentSysmatId].constraints[i];
-
-				projections.segment(c->c_idx, c->constraintNum) = c->project(x_now);
-
-				projections_pertype[c->constraintType].segment(c->c_weightless_idx,
-						c->constraintNum) =
-						projections.segment(c->c_idx, c->constraintNum);
-			}
-
-			timeSteptimer.toc();
-
-			timeSteptimer.tic("At_p");
-
-			if (calcualteSeperateAt_p) {
-#pragma omp parallel for if (OPENMP_ENABLED)
-				for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-					returnRecord.At_p_weightless_pertype[i] =
-							sysMat[currentSysmatId].A_t_pertype[i] * projections_pertype[i] /
-							std::sqrt(*(k_stiff_arr[i]));
-				}
-			}
-
-			timeSteptimer.toc();
-			timeSteptimer.tic("calc b");
-			b = (sysMat[currentSysmatId].A_t * projections) *
-							(sceneConfig.timeStep * sceneConfig.timeStep) +
-					M_times_sn;
-			timeSteptimer.toc();
-
-			double deltav_prim_changes = 0;
-			std::pair<VecXd, VecXd> collisionResults;
-			timeSteptimer.tic("b_tilde and f");
-			VecXd b_tilde = (b - P_times_xn) / sceneConfig.timeStep;
-			f = b_tilde - sysMat[currentSysmatId].C * v_now;
-			VecXd r_prim(3 * primitives.size());
-			timeSteptimer.toc();
-
-			if (contactEnabled) {
-				if (iterIdx == 0) {
-					detectionInfos = collisionDetection(x_n, v_now, xnew_n_primitives,
-							v_n_primitives);
-				}
-				timeSteptimer.tic("calc r");
-				collisionResults = calculateDryFrictionVector(f, detectionInfos);
-				r = collisionResults.first;
-				r_prim = collisionResults.second;
-				timeSteptimer.toc();
-			} else {
-				r.setZero();
-				r_prim.setZero();
-			}
-			timeSteptimer.tic("solve and update");
-#ifdef __APPLE__
-			if (g_useSlangCG && sysMat[currentSysmatId].slangCG) {
-				// Slang/Metal CG path. PR #35 found that fresh-allocating
-				// rhs_vec / x_vec per solve thrashes the heap and slows
-				// down every CPU-only phase by 7-23x (cache eviction).
-				// Reuse thread-local buffers: vector::assign() retains
-				// capacity once grown to N, so subsequent calls are
-				// allocation-free.
-				auto _t0 = std::chrono::steady_clock::now();
-				VecXd rhs = b_tilde + r;
-				static thread_local std::vector<double> rhs_vec;
-				static thread_local std::vector<double> x_vec;
-				rhs_vec.assign(rhs.data(), rhs.data() + rhs.size());
-
-				// [experiment] MOCK_SOLVE_OVERWRITE=1: do the full Metal
-				// solve (paying the dispatch + buffer-touch cost) but
-				// OVERWRITE v_new with the Eigen LLT solve result.
-				// Keeps the simulation correct so iteration count
-				// matches the Eigen baseline; isolates the Metal cost
-				// per solve.
-				static const bool s_mockOverwrite =
-					(std::getenv("MOCK_SOLVE_OVERWRITE") != nullptr);
-				// CG settings: tol=1e-4 max_iter=60 was found to be the
-				// sweet spot by the 3x3 sweep documented in PR #38.
-				// At that setting, dress per-step drops from 3.76s
-				// (baseline tol=1e-3 max_iter=15) to 1.84s — 51% faster
-				// because PD outer iter count drops 4.3x when inner
-				// solves are accurate to ~1e-4 (~ fp32 precision floor).
-				// Tighter tol caps because CG can't push below fp32's
-				// noise floor of ~1e-4 relative.
-				// Configurable at runtime for further sweeps without
-				// rebuilding.
-				static const float s_tol =
-					(std::getenv("SLANG_CG_TOL") != nullptr)
-					 ? float(std::atof(std::getenv("SLANG_CG_TOL"))) : 1e-4f;
-				static const int s_maxIter =
-					(std::getenv("SLANG_CG_MAX_ITER") != nullptr)
-					 ? std::atoi(std::getenv("SLANG_CG_MAX_ITER")) : 60;
-				int iters = sysMat[currentSysmatId].slangCG->solve(
-					rhs_vec, x_vec, /*tol=*/s_tol, /*max_iter=*/s_maxIter);
-				const long long _us = std::chrono::duration_cast<std::chrono::microseconds>(
-					std::chrono::steady_clock::now() - _t0).count();
-				static int s_solveCount = 0;
-				if (s_solveCount < 3 || (s_solveCount % 500) == 0) {
-					std::printf("[slang-cg] solve #%d  rows=%lld  iters=%d  wall=%lld us\n",
-					            s_solveCount, (long long)rhs.size(), iters,
-					            (long long)_us);
-				}
-				++s_solveCount;
-				if (iters < 0) {
-					std::fprintf(stderr,
-					             "[slang-cg] solve() returned %d; falling back to LLT\n",
-					             iters);
-					v_new = sysMat[currentSysmatId].solver.solve(b_tilde + r);
-				} else if (s_mockOverwrite) {
-					// Discard Metal result; use Eigen LLT for v_new so
-					// the iteration count matches the baseline.
-					v_new = sysMat[currentSysmatId].solver.solve(b_tilde + r);
-				} else {
-					v_new = Eigen::Map<VecXd>(x_vec.data(), x_vec.size());
-				}
-			} else {
-				v_new = sysMat[currentSysmatId].solver.solve(b_tilde + r);
-			}
-#else
-			v_new = sysMat[currentSysmatId].solver.solve(b_tilde + r);
-#endif
-			x_new = v_new * sceneConfig.timeStep + x_n;
-
-			timeSteptimer.toc();
-
-			bool testvbased_vs_xbased = false;
-			if (testvbased_vs_xbased) {
-				VecXd x_new2 = sysMat[currentSysmatId].solver.solve(
-						b + sceneConfig.timeStep * r);
-				VecXd diff = x_new - x_new2;
-				std::printf("xnew1: %.6f xnew2: %.6f diff: %.6f error: %.6f\n",
-						x_new.norm(), x_new2.norm(), diff.norm(),
-						std::abs(diff.dot(x_now.cwiseInverse()) / diff.rows()));
-			}
-
-#ifdef DEBUG_EXPLOSION
-			x_newAndErrors.emplace_back(
-					std::make_pair(x_new, P * x_new - (b_tilde + r)));
-			fAndRs.emplace_back(std::make_pair(f, r));
-#endif
-
-			timeSteptimer.tic("step primitives");
-			if (false) {
-				VecXd delta_v_primitives_new =
-						(f_primitives * sceneConfig.timeStep + r_prim)
-								.cwiseProduct(m_primitivesinv);
-				deltav_prim_changes =
-						(delta_v_primitives_new - delta_v_primitives).norm();
-				delta_v_primitives = delta_v_primitives_new;
-
-				vnew_n_primitives = v_n_primitives + delta_v_primitives;
-				xnew_n_primitives =
-						x_n_primitives + sceneConfig.timeStep * vnew_n_primitives;
-				for (int i = 0; i < primitives.size(); i++) {
-					Primitive *prim = primitives[i];
-					if (contactEnabled && prim->isEnabled && (!prim->isStaitc)) {
-						prim->velocity = vnew_n_primitives.segment(i * 3, 3);
-						prim->center = xnew_n_primitives.segment(i * 3, 3);
-					}
-				}
-			}
-			timeSteptimer.toc();
-			timeSteptimer.tic("update");
-
-			//            #pragma omp parallel for if (OPENMP_ENABLED)
-			for (int i = 0; i < particles.size(); i++) {
-				Particle &p = particles[i];
-				p.velocity = v_new.segment(p.idx * 3, 3);
-				p.pos = x_new.segment(p.idx * 3, 3);
-			}
-			timeSteptimer.toc();
-
-			timeSteptimer.tic("Convergence Test and Cleanup");
-			double x_diff = ((x_new - x_now).norm() * (1.0 / particles.size()));
-			if (x_diff < min_xdiff) {
-				min_xdiff = x_diff;
-				min_xdiffiter = iterIdx;
-				x_new_lastconverging = x_new;
-				v_new_lastconverging = v_new;
-			}
-			bool converged = x_diff < CONVERGE_EPSILON;
-			bool finished = converged || (iterIdx == PD_TOTAL_ITER - 1);
-
-			if (converged) {
-				// has converged
-				if (printOptimizationDetails)
-					std::printf(
-							"pd converging at iteration %d with error: %.10f thresh: %.10f\n",
-							iterIdx, x_diff, CONVERGE_EPSILON);
-				totalIter += iterIdx + 1;
-				returnRecord.converged = true;
-				returnRecord.totalConverged++;
-
-				returnRecord.convergeIter = iterIdx + 1;
-				returnRecord.cumulateIter =
-						returnRecord.convergeIter +
-						(forwardRecords.empty()
-										? 0
-										: forwardRecords[forwardRecords.size() - 1].cumulateIter);
-				timeSteptimer.toc();
-				break;
-			} else {
-				curEnergy = newEnergy;
-				if (iterIdx == PD_TOTAL_ITER - 1) {
-					returnRecord.converged = false;
-					returnRecord.convergeIter = PD_TOTAL_ITER;
-					returnRecord.cumulateIter =
-							returnRecord.convergeIter +
-							(forwardRecords.empty()
-											? 0
-											: forwardRecords[forwardRecords.size() - 1].cumulateIter);
-
-					bool revertToLastConverging = true;
-					if (revertToLastConverging) {
-						x_new = x_new_lastconverging;
-						v_new = v_new_lastconverging;
-#pragma omp parallel for if (OPENMP_ENABLED)
-						for (int i = 0; i < particles.size(); i++) {
-							Particle &p = particles[i];
-							p.velocity = v_new.segment(p.idx * 3, 3);
-							p.pos = x_new.segment(p.idx * 3, 3);
-						}
-					}
-					if (printOptimizationDetails)
-						if (printVerbose)
-							std::printf("pd not converged at last iteration %d\n", iterIdx);
-				}
-				timeSteptimer.toc();
-			}
-		}
 	}
 
 	timeSteptimer.ticEnd();
@@ -2080,10 +1814,10 @@ void Simulation::step() {
 
 #ifdef CLOTH_HAVE_GPU_AVBD
 	// Per-step PD displacement |x_new − x_n| for direct comparison
-	// with avbd-shadow's dxMax/dxMean (which measures |avbd − x_n|).
+	// with avbd-step's dxMax/dxMean (which measures |avbd - x_n|).
 	// If pd_dx_max and avbd_dx_max diverge much, the AVBD solve
 	// disagrees with PD on what implicit Euler "should" produce.
-	if (g_useAvbd && currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok()) {
+	if (currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok()) {
 		double pdMax = 0.0, pdMean = 0.0;
 		const size_t nDof = size_t(x_new.size());
 		for (size_t i = 0; i < nDof; ++i) {
@@ -2147,14 +1881,12 @@ void Simulation::step() {
 		//   slangCG                    → custom slang CG path
 		//   default                    → DiffCloth's Eigen LLT-preconditioned PD
 		static const bool s_benchDrive   = avbdCfg().drive;
-		static const bool s_benchSkipPD  = avbdCfg().skipPD;
-		const bool avbdDroveThis = s_benchDrive && g_useAvbd && currentSysmatId == 0 &&
+		const bool avbdDroveThis = s_benchDrive && currentSysmatId == 0 &&
 		    sysMat[0].avbd && sysMat[0].avbd->ok();
+		// PD no longer runs alongside AVBD, so the old "avbd+pd"
+		// shadow-comparison label has nothing left to describe.
 		const char* path =
-			avbdDroveThis && s_benchSkipPD ? "avbd"
-			: avbdDroveThis                 ? "avbd+pd"
-			: (g_useSlangCG && currentSysmatId < (int)sysMat.size()
-			   && sysMat[currentSysmatId].slangCG) ? "slang"
+			avbdDroveThis ? "avbd"
 			: "eigen-llt";
 #else
 		const char* path = "eigen-llt";
@@ -2166,24 +1898,17 @@ void Simulation::step() {
 	}
 
 #ifdef CLOTH_HAVE_GPU_AVBD
-	// AVBD_DRIVE=1 commits AVBD's shadow output as the simulation
-	// outcome — overrides PD's converged Particle.pos and recomputes
-	// velocity from the AVBD delta. Use ONLY when you've verified
-	// AVBD converges to a sensible state on this scene (per #86 the
-	// dress's "conv_max" is slow linear convergence, not divergence,
-	// so this should be safe).
+	// Commit AVBD's result as the simulation outcome: write
+	// Particle.pos and recompute Particle.velocity from the AVBD delta.
+	// Positions were already read into `avbdPos` earlier in step(); we
+	// re-read here to pick up the latest copy after the iteration loop.
 	//
-	// The shadow shuttle already read AVBD positions into `avbdPos`
-	// earlier in step(); we re-read here to get the latest copy
-	// after the iter loop completed. Particle.pos and Particle.velocity
-	// are updated; collision / contact / fixed points stay whatever
-	// the PD pass computed (potentially inconsistent — that's why
-	// this is opt-in).
-	// AVBD_DRIVE is default-on under AVBD; AVBD_NO_DRIVE=1 disables it
-	// so PD's converged Particle.pos is preserved (useful for shadow
-	// comparison or debugging).
+	// AVBD_NO_DRIVE=1 skips the write-back. It used to leave PD's
+	// converged Particle.pos in place for shadow comparison; with PD
+	// gone it leaves the state un-advanced, and the forward step aborts
+	// earlier rather than reach here.
 	static const bool s_avbdDrive = avbdCfg().drive;
-	const bool s_avbdDriveActive = s_avbdDrive && g_useAvbd && currentSysmatId == 0 &&
+	const bool s_avbdDriveActive = s_avbdDrive && currentSysmatId == 0 &&
 	    sysMat[0].avbd && sysMat[0].avbd->ok();
 	if (s_avbdDriveActive) {
 		std::vector<float> avbdPosFinal;
@@ -2430,347 +2155,6 @@ void Simulation::step() {
 			std::printf("\n");
 		}
 	}
-}
-
-VecXd Simulation::solveDirect(VecXd &dL_dxnew, double t_2, SpMat &dproj_dxnew_t,
-		SystemMatrix &currentSysMat, SpMat &dr_df_plusI_t,
-		SpMat &dr_df_t) {
-	timeSteptimer.tic("solveDirect"); // solve
-	SpMat delta_P_T = t_2 * dproj_dxnew_t * currentSysMat.A * dr_df_plusI_t -
-			currentSysMat.C_t * dr_df_t;
-
-	SpMat P_N_T = currentSysMat.P - delta_P_T;
-	factorizeDirectSolverBiCGSTAB(P_N_T, solverBiCGSTAB, "factorize solverBiCGSTAB");
-	VecXd u_star = solverBiCGSTAB.solve(dL_dxnew);
-	timeSteptimer.toc();
-	return u_star;
-}
-
-Simulation::BackwardInformation Simulation::stepBackwardNN(
-		Simulation::BackwardTaskInformation &taskInfo, VecXd &dL_dxnew,
-		VecXd &dL_dvnew, const ForwardInformation &forwardInfo_new, bool isStart,
-		const VecXd &dL_dxinit, const VecXd &dL_dvinit) {
-	Simulation::BackwardInformation backwardInfoNew = backwardInfoDefault;
-	backwardInfoNew.dL_dx = dL_dxnew;
-	backwardInfoNew.dL_dv = dL_dvnew;
-
-	return stepBackward(taskInfo, backwardInfoNew, forwardInfo_new, isStart,
-			dL_dxinit, dL_dvinit);
-}
-
-Simulation::BackwardInformation
-Simulation::stepBackward(Simulation::BackwardTaskInformation &taskInfo,
-		Simulation::BackwardInformation &gradient_new,
-		const ForwardInformation &forwardInfo_new,
-		bool isStart, const VecXd &dL_dxinit,
-		const VecXd &dL_dvinit) {
-	if (gradientClipping) {
-		double dL_dx_maxnorm = gradientClippingThreshold;
-		if (gradient_new.dL_dx.norm() > dL_dx_maxnorm * particles.size()) {
-			//      Logging::logColor("gradient clipped at " +
-			//      std::to_string(forwardInfo_new.stepIdx) + ": norm " +
-			//      d2str(gradient_new.dL_dx.norm(), 4), Logging::MAGENTA);
-			gradient_new.dL_dx = gradient_new.dL_dx * dL_dx_maxnorm *
-					particles.size() / gradient_new.dL_dx.norm();
-		}
-	}
-	int TOTAL_DOF = particles.size() * 3;
-	bool printApproximations = false;
-	int backwardIdx = forwardRecords.size() - forwardInfo_new.stepIdx;
-
-	VecXd dL_dx(TOTAL_DOF), dL_dv(TOTAL_DOF);
-	VecXd x_new = forwardInfo_new.x;
-	VecXd v_new = forwardInfo_new.v;
-	VecXd f_new = forwardInfo_new.f;
-	VecXd &dL_dxnew = gradient_new.dL_dx;
-	VecXd &dL_dvnew = gradient_new.dL_dv;
-	int goodMatrix = gradient_new.goodMatrixCounter;
-	int badMatrix = gradient_new.badMatrixCounter;
-	double dL_dknew = 0;
-	double dL_dknew_pertype[Constraint::CONSTRAINT_NUM] = { 0 };
-	VecXd dL_dfext_vec(3 * particles.size());
-	SystemMatrix &currentSysMat = sysMat[forwardInfo_new.sysMatId];
-	VecXd dL_dm(9 * currentSysMat.fixedPoints.size());
-	std::vector<std::pair<int, double>> dL_dmu;
-	dL_dfext_vec.setZero();
-	dL_dm.setZero();
-	dL_dx = dL_dxinit;
-	dL_dv = dL_dvinit;
-	BackwardInformation ret = backwardInfoDefault;
-	SpMat dr_df_plusI(3 * particles.size(), 3 * particles.size()),
-			dr_df_plusI_t(3 * particles.size(), 3 * particles.size()),
-			dr_df(3 * particles.size(), 3 * particles.size()),
-			dr_df_t(3 * particles.size(), 3 * particles.size());
-	dr_df_plusI.setIdentity();
-	dr_df_plusI_t.setIdentity();
-	dr_df.setZero();
-	dr_df_t.setZero();
-	VecXd dr_dd(3 * particles.size());
-	dr_dd.setZero();
-
-	VecXd u_star_prev(3 * particles.size()), u_star(3 * particles.size());
-	u_star_prev.setZero();
-	u_star.setZero();
-
-	Timer timeSteptimer;
-	timeSteptimer.enabled = true;
-	timeSteptimer.ticStart();
-	timeSteptimer.tic("contact_grad");
-
-	if (contactEnabled) {
-		bool calculatePrimitiveGradient = false;
-		std::pair<std::pair<SpMat, SpMat>, VecXd> drall_dfall = calculatedr_df(
-				forwardInfo_new.collisionInfos, calculatePrimitiveGradient,
-				taskInfo.dL_density && taskInfo.adddr_dd);
-		dr_df = drall_dfall.first.first;
-		dr_df_t = dr_df.transpose();
-		dr_dd = drall_dfall.second;
-		dr_df_plusI += dr_df;
-		dr_df_plusI_t = dr_df_plusI.transpose();
-	}
-
-	timeSteptimer.toc();
-	double timeStep = sceneConfig.timeStep;
-	double t_2 = timeStep * timeStep;
-
-	{
-		timeSteptimer.tic("PD init");
-
-		// step1: dl/dx add dL/vnew * dvnew/dx yellow
-		dL_dx += dL_dvnew * (-1.0 / sceneConfig.timeStep); // yellow
-		dproj_dxnew = SpMat(currentSysMat.constraintNum, 3 * particles.size());
-		dproj_dxnew.setZero();
-		TripleVector triplets;
-		timeSteptimer.toc();
-		timeSteptimer.tic("projection");
-#pragma omp parallel for if (OPENMP_ENABLED)
-		for (int i = 0; i < sysMat[currentSysmatId].constraints.size(); i++) {
-			Constraint *c = sysMat[currentSysmatId].constraints[i];
-			c->projectBackwardPrecompute(x_new);
-		}
-
-		for (Constraint *c : sysMat[currentSysmatId].constraints) {
-			c->projectBackward(x_new, triplets);
-		}
-
-		dproj_dxnew.setFromTriplets(triplets.begin(), triplets.end());
-		dproj_dxnew_t = dproj_dxnew.transpose();
-
-		timeSteptimer.toc();
-		ret.rho =
-				0; // (P_inv * delta_P).toDense().eigenvalues().cwiseAbs().maxCoeff();
-
-		// solve
-
-		{
-			timeSteptimer.tic("delta_P_T");
-			int MAX_ITER_NUM = 400;
-			u_star_prev.setZero();
-			timeSteptimer.toc();
-			u_star = solveDirect(dL_dxnew, t_2, dproj_dxnew_t, currentSysMat,
-					dr_df_plusI_t, dr_df_t);
-		}
-
-		// step2: red
-		dL_dx += M * u_star;
-
-		// step3: blue dl/dv = dL/dnew * dxnew/dv  blue edg
-		dL_dv += sceneConfig.timeStep * (dr_df_plusI * M).transpose() * u_star;
-
-		// step4:dl/dx add dL/v * dv/dx green edge
-		if (!isStart) {
-			dL_dx += dL_dv * 1.0 / sceneConfig.timeStep;
-		}
-	}
-
-	timeSteptimer.tic("gradients");
-	if (taskInfo.dL_dmu) {
-		bool bruteCalc = true;
-		std::vector<VecXd> dr_dmu = calculatedr_dmu(
-				forwardInfo_new.collisionInfos.first.first, taskInfo.mu_primitives);
-		for (int i = 0; i < taskInfo.mu_primitives.size(); i++) {
-			double dL_dmui = dr_dmu[i].transpose() * sceneConfig.timeStep * u_star;
-			dL_dmu.emplace_back(gradient_new.dL_dmu[i].first,
-					dL_dmui + gradient_new.dL_dmu[i].second);
-		}
-		ret.dL_dmu = dL_dmu;
-	}
-
-	// spline parameters
-	ret.dL_dsplines = gradient_new.dL_dsplines;
-	ret.dL_dxfixed = forwardInfo_new.x_fixedpoints;
-	ret.dL_dxfixed_accum = forwardInfo_new.x_fixedpoints;
-	ret.dL_dxfixed.setZero();
-	ret.dL_dxfixed_accum.setZero();
-
-	if (taskInfo.dL_dcontrolPoints &&
-			(!currentSysMat.controlPointSplines.empty())) {
-		int sysMatId = forwardInfo_new.sysMatId;
-		// 3m x s
-		SpMat rhs_xfixed = sceneConfig.timeStep * sceneConfig.timeStep *
-				dr_df_plusI * sysMat[sysMatId].A_t_dp_dxfixed; // 3m x s
-		ret.dL_dxfixed = rhs_xfixed.transpose() * u_star;
-		perStepGradient.emplace_back(ret.dL_dxfixed);
-		if (forwardInfo_new.stepIdx == 1) {
-			std::reverse(perStepGradient.begin(), perStepGradient.end());
-		}
-
-		if (gradient_new.dL_dxfixed_accum.rows() == ret.dL_dxfixed_accum.rows()) {
-			ret.dL_dxfixed_accum = ret.dL_dxfixed + gradient_new.dL_dxfixed_accum;
-		}
-		for (int splineIdx = 0;
-				splineIdx < sysMat[sysMatId].controlPointSplines.size(); splineIdx++) {
-			Spline &s = sysMat[sysMatId].controlPointSplines[splineIdx];
-			MatXd dxfixed_dspline =
-					s.dxfixed_dcontrolPoints(forwardInfo_new.simDurartionFraction);
-			SpMat dxfixed_dspline_sparse = dxfixed_dspline.sparseView().pruned();
-			SpMat rhs_spline =
-					sceneConfig.timeStep * sceneConfig.timeStep * dr_df_plusI *
-					(sysMat[sysMatId].A_t_dp_dxfixed.block(0, s.pFixed * 3,
-							 3 * particles.size(), 3) *
-							dxfixed_dspline_sparse); // 3m x s
-			rhs_spline = rhs_spline.pruned();
-			VecXd deltaGrad = rhs_spline.transpose() * u_star;
-
-			ret.dL_dsplines[sysMatId][splineIdx] += deltaGrad;
-		}
-	}
-
-	if (taskInfo.dL_density) {
-		VecXd dMy_dd =
-				Area * (forwardInfo_new.x_prev + sceneConfig.timeStep * forwardInfo_new.v_prev + sceneConfig.timeStep * sceneConfig.timeStep * gravity_n);
-		VecXd df_dd =
-				Area * (forwardInfo_new.v_prev + sceneConfig.timeStep * gravity_n);
-		VecXd rhs = dMy_dd + sceneConfig.timeStep * dr_df * df_dd -
-				Area * forwardInfo_new.x + sceneConfig.timeStep * dr_dd;
-		ret.dL_ddensity = gradient_new.dL_ddensity + u_star.dot(rhs);
-	}
-
-	for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-		if (taskInfo.dL_dk_pertype[i]) {
-			// A default-constructed VecXd is size 0 with a null data
-			// pointer, and Eigen will happily accept it as an operand:
-			// the failure surfaces much later as a size assertion, or
-			// in a build without assertions as a null store inside the
-			// vectorized assignment loop. Say what is actually wrong.
-			//
-			// This field is only written when PD's forward loop runs
-			// (runPDLoop, Simulation.cpp:1783). When AVBD drives and
-			// PD's forward is skipped, it is never populated -- so
-			// PD's adjoint cannot be used on an AVBD-driven forward
-			// that also asks for per-type stiffness gradients.
-			if (forwardInfo_new.At_p_weightless_pertype[i].size() == 0) {
-				Logging::logColor(
-						"[backward] At_p_weightless_pertype[" + std::to_string(i) +
-								"] is empty: PD's adjoint needs per-type A_t*p, which "
-								"is only computed when PD's forward loop runs. The "
-								"forward was driven by AVBD with PD's loop skipped. "
-								"Use USE_AVBD_BWD=1 (AVBD adjoint), USE_PD=1 (all PD), "
-								"or AVBD_NO_SKIP_PD=1 (keep PD's forward state).\n",
-						Logging::LogColor::RED);
-				continue;
-			}
-			VecXd dA_t_times_p_dk = forwardInfo_new.At_p_weightless_pertype[i];
-			VecXd A_t_A_weightless_times_xnew =
-					currentSysMat.A_t_times_A_pertype[i] * x_new;
-			VecXd df_dk = sceneConfig.timeStep * dA_t_times_p_dk -
-					sceneConfig.timeStep * A_t_A_weightless_times_xnew;
-
-			VecXd rhs =
-					sceneConfig.timeStep * sceneConfig.timeStep * dA_t_times_p_dk +
-					sceneConfig.timeStep * dr_df * df_dk -
-					sceneConfig.timeStep * sceneConfig.timeStep *
-							A_t_A_weightless_times_xnew;
-			double dL_dk_new = u_star.dot(rhs);
-
-			VecXd dL_dk_perelem = u_star.cwiseProduct(rhs);
-
-			ret.dL_dk_pertype[i] = gradient_new.dL_dk_pertype[i] + dL_dk_new;
-		}
-	}
-
-	if (taskInfo.dL_dfext) {
-		dL_dfext_vec = sceneConfig.timeStep * sceneConfig.timeStep *
-				dr_df_plusI.transpose() * u_star *
-				forwardInfo_new.windFactor;
-		ret.dL_dfext = gradient_new.dL_dfext;
-		for (int i = 0; i < particles.size(); i++) {
-			Vec3d delta = dL_dfext_vec.segment(i * 3, 3);
-			if (sceneConfig.windConfig == WindConfig::WIND_SIN_AND_FALLOFF) {
-				delta = delta.cwiseProduct(windFallOff.segment(i * 3, 3));
-			}
-			ret.dL_dfext += delta;
-		}
-	}
-
-	if (taskInfo.dL_dconstantForceField) {
-		ret.dL_dconstantForceField = gradient_new.dL_dconstantForceField +
-				sceneConfig.timeStep * sceneConfig.timeStep *
-						dr_df_plusI.transpose() * u_star;
-	}
-
-	if (taskInfo.dL_dwindFactor) {
-		dL_dfext_vec = sceneConfig.timeStep * sceneConfig.timeStep *
-				dr_df_plusI.transpose() * u_star;
-		ret.dL_dwindtimestep = gradient_new.dL_dwindtimestep;
-		ret.dL_dwindtimestep[forwardInfo_new.stepIdx] = 0;
-		for (int i = 0; i < particles.size(); i++) {
-			ret.dL_dwindtimestep[forwardInfo_new.stepIdx] +=
-					dL_dfext_vec.segment(i * 3, 3).dot(
-							(wind * windNorm).cwiseProduct(windFallOff.segment(i * 3, 3)));
-		}
-	}
-
-	if (taskInfo.dL_dfwind) {
-		if ((sceneConfig.windConfig != WindConfig::WIND_SIN) &&
-				(sceneConfig.windConfig != WindConfig::WIND_SIN_AND_FALLOFF))
-			std::printf("WARNING: Calculating gradient for sin wind model but config "
-						"is not sin wind!\n");
-
-		dL_dfext_vec = sceneConfig.timeStep * sceneConfig.timeStep *
-				dr_df_plusI.transpose() * u_star;
-		ret.dL_dwind = gradient_new.dL_dwind;
-		Mat3x5d dfext_dwind;
-		dfext_dwind.setZero();
-		dfext_dwind.block<3, 3>(0, 0) =
-				Mat3x3d::Identity() * forwardInfo_new.windFactor;
-		Vec3d windForce = forwardInfo_new.windParams.segment(0, 3);
-		double cos_atplusb =
-				std::cos(forwardInfo_new.windParams[3] * forwardInfo_new.t +
-						forwardInfo_new.windParams[4]);
-		dfext_dwind.col(3) = windForce * cos_atplusb * 0.5 * forwardInfo_new.t;
-		dfext_dwind.col(4) = windForce * cos_atplusb * 0.5;
-		Mat5x3d dfext_dwind_T = dfext_dwind.transpose();
-
-		Vec3d dL_dfext_total;
-		dL_dfext_total.setZero();
-		for (int i = 0; i < particles.size(); i++) {
-			if (sceneConfig.windConfig == WindConfig::WIND_SIN_AND_FALLOFF) {
-				dL_dfext_total += dL_dfext_vec.segment(i * 3, 3).cwiseProduct(
-						windFallOff.segment(i * 3, 3));
-			} else {
-				dL_dfext_total += dL_dfext_vec.segment(i * 3, 3);
-			}
-		}
-		Vec5d dL_dwind = dfext_dwind_T * dL_dfext_total;
-
-		ret.dL_dwind += dL_dwind;
-	}
-
-	timeSteptimer.toc(); // gradients
-	timeSteptimer.ticEnd();
-	ret.timer = timeSteptimer.getReportMicroseconds();
-	ret.accumSolvePerformanceReport = Timer::addPerf(
-			ret.timer.solvePerfReport, gradient_new.accumSolvePerformanceReport);
-	ret.accumTimer =
-			Timer::addTimer(ret.timer.timeMicroseconds, gradient_new.accumTimer);
-	ret.totalRuntime = gradient_new.totalRuntime + ret.timer.totalMicroseconds;
-
-	ret.dL_dx = dL_dx;
-	ret.dL_dv = dL_dv;
-	ret.loss = gradient_new.loss;
-
-	return ret;
 }
 
 // CHI-14 Brick D: AVBD-backed single-step adjoint.
@@ -4216,13 +3600,9 @@ void Simulation::updateMassMatrix() {
 		std::printf("\n");
 	}
 
-	// Msolver is only consumed by PD's forward CG path. When AVBD
-	// drives the step (default on Apple Silicon), the factorization
-	// is dead state — M is diagonal so LLT(M) is trivial, but the
-	// solver object still allocates symbolic + numerical factors.
-	if (pdForwardActive()) {
-		factorizeDirectSolverLLT(M, Msolver, "Msolver pre factorization");
-	}
+	// Msolver was only ever consumed by PD's forward CG path. It is gone
+	// -- M is diagonal, so LLT(M) was trivial arithmetic, but the solver
+	// object still allocated symbolic and numerical factors for it.
 }
 
 void Simulation::initializePrefactoredMatrices() {
@@ -4256,77 +3636,26 @@ void Simulation::initializePrefactoredMatrices() {
 					sysMat[sysMatId].constraintNum_pertype[s->constraintType], false);
 		}
 
-		for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-			if (sysMatId == 0) {
-				projections.setZero(sysMat[sysMatId].constraintNum, 1);
-				projections_pertype[i] =
-						VecXd(sysMat[sysMatId].constraintNum_pertype[i]);
-				projections_pertype[i].setZero();
-			}
-
-			sysMat[sysMatId].A_pertype[i] = SpMat(
-					sysMat[sysMatId].constraintNum_pertype[i], 3 * particles.size());
-			sysMat[sysMatId].A_pertype[i].setFromTriplets(triplets_pertype[i].begin(),
-					triplets_pertype[i].end());
-			sysMat[sysMatId].A_t_pertype[i] =
-					sysMat[sysMatId].A_pertype[i].transpose();
-			sysMat[sysMatId].A_t_times_A_pertype[i] =
-					sysMat[sysMatId].A_t_pertype[i] * sysMat[sysMatId].A_pertype[i];
-		}
-
-		dproj_dxnew = SpMat(sysMat[sysMatId].constraintNum, 3 * particles.size());
-		dproj_dxnew.setZero();
-		sysMat[sysMatId].A =
-				SpMat(sysMat[sysMatId].constraintNum, 3 * particles.size());
-
-		I = SpMat(3 * particles.size(), 3 * particles.size());
-		I.setIdentity();
-		sysMat[sysMatId].A.setFromTriplets(triplets.begin(), triplets.end());
-
-		sysMat[sysMatId].A = sysMat[sysMatId].A.pruned();
-
-		sysMat[sysMatId].A_t = sysMat[sysMatId].A.transpose(); // 3m x constrainNum
-		sysMat[sysMatId].C = sysMat[sysMatId].A_t * sysMat[sysMatId].A *
-				(sceneConfig.timeStep * sceneConfig.timeStep);
-		sysMat[sysMatId].C = sysMat[sysMatId].C.pruned(1e-15);
-		sysMat[sysMatId].C_t = sysMat[sysMatId].C.transpose();
-		sysMat[sysMatId].P = sysMat[sysMatId].C + M;
-		// PD's LLT factorization is the most expensive init step
-		// (sparse Cholesky on a 10K × 10K matrix takes 0.5-1.5 s on
-		// dress). Skip it when AVBD is the runtime solver — step()
-		// never solves with it. The P matrix itself stays built (used
-		// by other code paths) but the factorization is the costly part.
-		if (g_useAvbd) {
-			std::printf("[avbd-init] skipped LLT prefactorization for "
-			            "sysMat[%d] (AVBD path)\n", sysMatId);
-		} else {
-			sysMat[sysMatId].P =
-					factorizeDirectSolverLLT(sysMat[sysMatId].P, sysMat[sysMatId].solver,
-							"Msolver pre factorization");
-		}
+		// The PD system matrices used to be assembled here: A and the
+		// per-type A_pertype from the constraint triplets, their
+		// transposes, C = A^T A h^2, P = C + M, and the LLT
+		// factorization of P. Every one of them was read only by PD's
+		// forward CG loop and PD's adjoint, both of which are gone, so
+		// all that remained was the cost -- sparse transposes and
+		// products over a 3N x constraintNum matrix, plus a sparse
+		// Cholesky on 10902 x 10902 for the dress, none of it ever
+		// consulted again.
+		//
+		// The constraint triplets are still walked above because
+		// constraintNum and constraintNum_pertype are what the AVBD
+		// uploads size themselves against.
 
 #ifdef __APPLE__
-		if (g_useSlangCG) {
-			auto csr = eigenToCSRf(sysMat[sysMatId].P);
-			auto solver = std::make_shared<cloth::MetalCGSolver>(
-				csr, slangMetallibDir().c_str());
-			if (solver->ok()) {
-				sysMat[sysMatId].slangCG = solver;
-				std::printf("[slang-cg] built MetalCGSolver for sysMat[%d] "
-				            "(rows=%u, nnz=%zu)\n",
-				            sysMatId, csr.rows, csr.colIdx.size());
-			} else {
-				std::fprintf(stderr,
-				             "[slang-cg] FAILED to build MetalCGSolver for "
-				             "sysMat[%d] (rows=%u); falling back to Eigen LLT\n",
-				             sysMatId, csr.rows);
-			}
-		}
 
 #endif  // __APPLE__
 
 #ifdef CLOTH_HAVE_GPU_AVBD
-		if (g_useAvbd && sysMatId == 0) {
+		if (sysMatId == 0) {
 			// PR-E continued: instantiate AvbdSolver at scene init and
 			// upload mesh state (positions, masses, invH²). Constraint
 			// uploads (springs, attachments, triangles, bendings)
@@ -4549,10 +3878,9 @@ void Simulation::initializePrefactoredMatrices() {
 						s.dp_dfixedPose();
 			}
 
-			SpMat dp_dfixedpossparse = dp_dfixedpos.sparseView();
-			dp_dfixedpossparse = dp_dfixedpossparse.pruned();
-			sysMat[sysMatId].A_t_dp_dxfixed =
-					(sysMat[sysMatId].A_t * dp_dfixedpossparse);
+			// dp_dfixedpos fed A_t_dp_dxfixed, which only PD's adjoint
+			// ever read. Both are gone.
+			(void)dp_dfixedpos;
 		}
 
 		std::printf("\n");
@@ -5470,15 +4798,23 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 				forwardRecords.size()); // FORWARD_STEPS = forwardRecords.size()) - 1
 	}
 
-	// CHI-14 Brick E: env-gate to swap PD adjoint for AVBD adjoint.
-	// USE_AVBD_BWD=1 routes per-step gradient through
-	// `stepBackwardAvbd` (Brick D) instead of `stepBackward`. Param
-	// gradients are accumulated across steps host-side here since the
-	// AVBD shim is stateless (does not take a `gradient_new`
-	// accumulator like the PD path does). Requires that the forward
-	// was driven by AVBD (`sysMat[0].avbd` set up).
-	const bool useAvbdBwd = avbdCfg().useAvbdBwd &&
-			!sysMat.empty() && sysMat[0].avbd && sysMat[0].avbd->ok();
+	// The AVBD adjoint is the only adjoint. Param gradients are
+	// accumulated across steps host-side here, since the AVBD shim is
+	// stateless and does not take a `gradient_new` accumulator the way
+	// the PD path did.
+	//
+	// This requires a working AVBD solver. If there is none the right
+	// answer is to say so, not to quietly produce PD's gradients -- a
+	// silent fallback is how a backend problem turns into a wrong
+	// gradient nobody notices.
+	const bool useAvbdBwd = !sysMat.empty() && sysMat[0].avbd && sysMat[0].avbd->ok();
+	if (!useAvbdBwd) {
+		std::fprintf(stderr,
+				"[avbd] FATAL: backward requires the AVBD solver, and it is not "
+				"available (sysMat empty, or avbd null/not ok). The PD adjoint has "
+				"been removed; there is nothing to fall back to.\n");
+		std::abort();
+	}
 	// CHI-111: truncated BPTT. Cap the chain to the K most-recent
 	// timesteps to bound the BPTT amplification. The AVBD per-step
 	// Jacobian has spectral radius ~√2 in some modes, so a 400-step
@@ -5503,7 +4839,7 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 	// iters; below that, the H is not a faithful IFT Jacobian.
 	const bool useAvbdIft = avbdCfg().bwdIft;
 	if (useAvbdBwd) {
-		std::printf("[avbd-bwd] USE_AVBD_BWD=1 — routing backward through "
+		std::printf("[avbd-bwd] routing backward through "
 					"Simulation::stepBackwardAvbd (truncate K=%d, IFT=%d)\n",
 				avbdBwdTruncateK, useAvbdIft ? 1 : 0);
 	}
@@ -5667,9 +5003,11 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 			derivative = avbdRet;
 			++avbdBwdStepsBack;
 		} else {
-			// backward from [x,v]_{idx} --> [x,v]_{idx-1}, calculate dL/dx_{idx-1}
-			derivative = stepBackward(taskConfiguration, derivative, record,
-					(idx - 1) == 0, dL_dxinit, dL_dvinit);
+			// Unreachable: useAvbdBwd is checked at the top of this
+			// function and aborts if AVBD is unavailable. The PD adjoint
+			// that used to run here is gone.
+			std::fprintf(stderr, "[avbd] FATAL: reached the removed PD adjoint branch.\n");
+			std::abort();
 		}
 		fullBackwardRecords.emplace_back(derivative);
 	}
@@ -6264,51 +5602,4 @@ VecXd Simulation::getParticleNormals(std::vector<Triangle> mesh,
 	return normals;
 }
 
-SpMat Simulation::factorizeDirectSolverBiCGSTAB(
-		const SpMat &A, Eigen::BiCGSTAB<Eigen::SparseMatrix<double>, Eigen::LeastSquareDiagonalPreconditioner<double>> &BiCGSTABSolver,
-		const std::string &warning_msg) {
-	BiCGSTABSolver.compute(A);
-	SpMat Afixed = A;
-	double regularization = 1e-10;
-	bool success = true;
-	SpMat I = SpMat(A.rows(), A.cols());
-	I.setIdentity();
-	while (BiCGSTABSolver.info() != Eigen::Success) {
-		regularization *= 10;
-		Afixed = Afixed + regularization * I;
-		BiCGSTABSolver.compute(Afixed);
-		success = BiCGSTABSolver.info();
-		if (regularization > 100)
-			break;
-	}
-	if (!success) {
-		std::cout << "Warning: " << warning_msg << " adding " << regularization
-				  << " identites.(BiCGSTA solver)" << std::endl;
-	}
 
-	return Afixed;
-}
-
-SpMat Simulation::factorizeDirectSolverLLT(
-		const SpMat &A, Eigen::SimplicialLLT<SpMat> &lltSolver,
-		const std::string &warning_msg) {
-	lltSolver.compute(A);
-	SpMat Afixed = A;
-	double regularization = 1e-10;
-	bool success = true;
-	SpMat I = SpMat(A.rows(), A.cols());
-	I.setIdentity();
-	while (lltSolver.info() != Eigen::Success) {
-		regularization *= 10;
-		Afixed = Afixed + regularization * I;
-		lltSolver.compute(Afixed);
-		success = lltSolver.info();
-	}
-	if (!success) {
-		//        std::cout << "Warning: " << warning_msg << " adding " <<
-		//        regularization << " identites.(llt solver)"
-		//                  << std::endl;
-	}
-
-	return Afixed;
-}

@@ -38,7 +38,7 @@
 #include "AttachmentSpring.h"
 #include <memory>
 
-namespace cloth { class MetalCGSolver; class AvbdSolver; }
+namespace cloth { class AvbdSolver; }
 
 #include "Constraint.h"
 #include "FixedPoint.h"
@@ -369,7 +369,6 @@ public:
 
 	static double windNorm, windFrequency, windPhase;
 	static double forwardConvergenceThreshold, backwardConvergenceThreshold;
-	static int PD_TOTAL_ITER;
 	bool runBackward, calcualteSeperateAt_p = false;
 	int uniqueID = 0;
 
@@ -396,15 +395,13 @@ public:
 		// so if constraint weight change, these matrices change
 		// Additionally, in our simulation sometimes the constraints need to be
 		// changed because of change of attachment constraints
-		SpMat P;
-		SpMat A;
-		SpMat A_t;
-		SpMat C;
-		SpMat C_t;
-		SpMat A_t_times_A_pertype[Constraint::CONSTRAINT_NUM];
-		SpMat A_pertype[Constraint::CONSTRAINT_NUM]; // without weight
-		SpMat A_t_pertype[Constraint::CONSTRAINT_NUM];
-		SpMat A_t_dp_dxfixed;
+		// P, A, A_t, C, C_t and the per-type A matrices lived here for
+		// PD's global solve. Nothing reads them since PD's forward and
+		// adjoint were removed, and neither does the SimplicialLLT that
+		// used to factorize P -- so a SystemMatrix copy no longer drags
+		// a sparse Cholesky behind it. Msolver and the unused BiCGSTAB
+		// went the same way: there is no sparse SOLVER left in the
+		// codebase, only sparse matrix types.
 		int constraintNum;
 		int constraintNum_pertype[Constraint::CONSTRAINT_NUM]; // without weight
 		int startFrameNum;
@@ -412,13 +409,6 @@ public:
 		std::vector<AttachmentSpring> attachments;
 		std::vector<FixedPoint> fixedPoints;
 		std::vector<Spline> controlPointSplines;
-		Eigen::SimplicialLLT<SpMat> solver;
-
-		// Optional Slang/Metal CG solver, built alongside the LLT solver
-		// when USE_SLANG_CG is set in the environment. shared_ptr so the
-		// SystemMatrix copy-ctor can default-share without re-uploading
-		// CSR to the GPU.
-		std::shared_ptr<cloth::MetalCGSolver> slangCG;
 
 		// Optional AVBD vertex-block-update solver, attached to sysMat[0]
 		// when USE_AVBD=1. Loads all 10 AVBD kernels (vbd_init,
@@ -431,27 +421,16 @@ public:
 		SystemMatrix() {}
 
 		SystemMatrix(const SystemMatrix &other) {
-			P = other.P;
-			A = other.A;
-			C = other.C;
-			C_t = other.C_t;
-			A_t = other.A_t;
 			attachments = other.attachments;
 			constraints = other.constraints;
-			A_t_dp_dxfixed = other.A_t_dp_dxfixed;
 			controlPointSplines = other.controlPointSplines;
 			fixedPoints = other.fixedPoints;
 			constraintNum = other.constraintNum;
-			slangCG = other.slangCG;       // share; not deep-copied
-			avbd    = other.avbd;          // share; not deep-copied
+			avbd = other.avbd;  // share; not deep-copied
 
 			for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-				A_t_times_A_pertype[i] = other.A_t_times_A_pertype[i];
-				A_pertype[i] = other.A_pertype[i];
-				A_t_pertype[i] = other.A_t_pertype[i];
 				constraintNum_pertype[i] = other.constraintNum_pertype[i];
 			}
-			P = factorizeDirectSolverLLT(P, solver, "sysmat");
 		}
 	};
 
@@ -501,8 +480,6 @@ public:
 	Simulation::ParamInfo groundtruthParam;
 	std::vector<std::vector<BackwardInformation>> backwardRecordsFiniteDiff;
 	Timer timer;
-	Eigen::SimplicialLLT<SpMat> Msolver;
-	Eigen::BiCGSTAB<Eigen::SparseMatrix<double>, Eigen::LeastSquareDiagonalPreconditioner<double>> solverBiCGSTAB;
 
 	Simulation(Vec3d center) :
 			systemCenter(center),
@@ -615,17 +592,6 @@ public:
 
 		return glm::vec3(p[0], p[1], p[2]);
 	}
-
-	BackwardInformation
-	stepBackwardNN(Simulation::BackwardTaskInformation &taskInfo, VecXd &dL_dxnew,
-			VecXd &dL_dvnew, const ForwardInformation &forwardInfo_new,
-			bool isStart, const VecXd &dL_dxinit, const VecXd &dL_dvinit);
-
-	BackwardInformation
-	stepBackward(Simulation::BackwardTaskInformation &taskInfo,
-			BackwardInformation &gradient_new,
-			const ForwardInformation &forwardInfo_new, bool isStart,
-			const VecXd &dL_dxinit, const VecXd &dL_dvinit);
 
 	// CHI-14 Brick D: AVBD-backed single-step adjoint. Wraps
 	// `cloth::avbdBackwardShim` (which calls AvbdSolver::stepBackward
@@ -1050,11 +1016,7 @@ private:
 			const Eigen::VectorXd &velocityVec,
 			const Eigen::VectorXd &posVec, double t_now);
 
-	static SpMat factorizeDirectSolverLLT(const SpMat &A,
-			Eigen::SimplicialLLT<SpMat> &lltSolver,
-			const std::string &warning_msg);
 
-	SpMat factorizeDirectSolverBiCGSTAB(const SpMat &A, Eigen::BiCGSTAB<Eigen::SparseMatrix<double>, Eigen::LeastSquareDiagonalPreconditioner<double>> &solverBiCGSTAB, const std::string &warning_msg);
 
 	std::chrono::steady_clock::time_point getTimeNow() {
 		return std::chrono::steady_clock::now();
@@ -1105,9 +1067,6 @@ public:
 
 	bool printVerbose;
 
-	VecXd solveDirect(VecXd &dL_dxnew, double t_2, SpMat &dproj_dxnew_t,
-			SystemMatrix &currentSysMat, SpMat &dr_df_plusI_t,
-			SpMat &dr_df_t);
 };
 
 #endif // OMEGAENGINE_SIMULATION_H
