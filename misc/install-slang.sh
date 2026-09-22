@@ -20,6 +20,14 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-x86_64)  ASSET="slang-${SLANG_VERSION}-macos-x86_64.zip"  ;;
   Linux-x86_64)   ASSET="slang-${SLANG_VERSION}-linux-x86_64.tar.gz" ;;
   Linux-aarch64)  ASSET="slang-${SLANG_VERSION}-linux-aarch64.tar.gz" ;;
+  # Git Bash / MSYS2 on Windows. The Vulkan SDK also ships a slangc, and
+  # tests/slang_validate/Makefile falls back to one on PATH when
+  # bin/.slang is absent -- this arm just makes the project-local
+  # toolchain available the same way it is everywhere else.
+  MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64)
+                  ASSET="slang-${SLANG_VERSION}-windows-x86_64.zip" ;;
+  MINGW*-aarch64|MSYS*-aarch64)
+                  ASSET="slang-${SLANG_VERSION}-windows-aarch64.zip" ;;
   *)
     echo "no prebuilt slang asset for $(uname -s)-$(uname -m)" >&2
     echo "see https://github.com/shader-slang/slang/releases" >&2
