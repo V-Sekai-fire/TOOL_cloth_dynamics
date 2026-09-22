@@ -27,6 +27,7 @@
 // Created by Yifei Li on 9/24/20.
 //
 
+#include <map>
 #include "Simulation.h"
 
 #ifdef __APPLE__
@@ -2215,6 +2216,7 @@ void Simulation::step() {
 		if (!s_avbdNoContact) {
 			size_t projHits = 0;
 			size_t frictionHits = 0;
+			std::vector<std::tuple<int, int, Vec3d>> frictionSensitivityThisStep;
 			for (size_t i = 0; i < particles.size(); ++i) {
 				for (Primitive* p : primitives) {
 					if (!p) continue;
@@ -2255,9 +2257,29 @@ void Simulation::step() {
 					const Vec3d v_rel_after =
 							(1.0 - clip) * v_tan_rel + vn_after * normal;
 					particles[i].velocity = v_rel_after + v_out;
+
+					// Record d v_new / d mu = -v_tan_rel for the AVBD
+					// adjoint. Zero where the clamp saturates, because
+					// there mu has no local influence at all.
+					if (p->mu > 0.0 && p->mu < 1.0) {
+						int primIdx = -1;
+						for (size_t q = 0; q < primitives.size(); ++q) {
+							if (primitives[q] == p) { primIdx = int(q); break; }
+						}
+						if (primIdx >= 0) {
+							frictionSensitivityThisStep.emplace_back(
+									primIdx, int(i), v_tan_rel);
+						}
+					}
 					if (p->mu > 0.0) ++frictionHits;
 					if (penetrating) ++projHits;
 				}
+			}
+			// The forward record was pushed before this contact pass ran,
+			// so the sensitivities land on the record just stored.
+			if (!forwardRecords.empty()) {
+				forwardRecords.back().frictionSensitivity =
+						std::move(frictionSensitivityThisStep);
 			}
 			if (frictionHits > 0)
 				std::printf("[avbd-friction] step %zu applied %zu vert/primitive friction events\n",
@@ -2773,7 +2795,8 @@ Simulation::stepBackward(Simulation::BackwardTaskInformation &taskInfo,
 Simulation::BackwardInformation Simulation::stepBackwardAvbd(
 		const Simulation::BackwardTaskInformation &taskInfo,
 		const VecXd &dL_dx_new,
-		const ForwardInformation &forwardInfo_new) {
+		const ForwardInformation &forwardInfo_new,
+		const ForwardInformation *forwardInfo_prev) {
 	Simulation::BackwardInformation ret = backwardInfoDefault;
 	const uint32_t nV = static_cast<uint32_t>(particles.size());
 
@@ -2830,6 +2853,55 @@ Simulation::BackwardInformation Simulation::stepBackwardAvbd(
 	ret.dL_dx = VecXd::Zero(3 * nV);
 	for (uint32_t i = 0; i < 3 * nV; ++i) {
 		ret.dL_dx[i] = g.dL_dx[i];
+	}
+
+	// ---- dL/dmu: the friction adjoint ------------------------------
+	//
+	// Friction is applied after the solve as an explicit closed-form
+	// map on the relative velocity:
+	//
+	//   v_rel_after = (1 - clamp(mu,0,1)) * v_tan_rel + max(vn,0) * n
+	//
+	// so mu enters through exactly one term and
+	//
+	//   d v_new / d mu = -v_tan_rel        (0 where the clamp saturates)
+	//
+	// The forward records v_tan_rel per contact (frictionSensitivity).
+	// mu perturbs v at step idx-1, which reaches the loss only through
+	// THIS step's predictor s_n = x + h*v + h^2*M^-1*f, so
+	//
+	//   dL/dv_{idx-1} = h * dL/d predicted_idx
+	//
+	// and g.dL_dpredicted is exactly that cotangent (CHI-113). This is
+	// what makes friction differentiable on the AVBD path at all --
+	// previously dL/dmu was identically zero, which is why the sphere
+	// demo could not move its only parameter.
+	if (taskInfo.dL_dmu && forwardInfo_prev != nullptr &&
+			!g.dL_dpredicted.empty()) {
+		const double h = sceneConfig.timeStep;
+		std::map<int, double> perPrim;
+		for (const auto &ev : forwardInfo_prev->frictionSensitivity) {
+			const int primIdx = std::get<0>(ev);
+			const int vertIdx = std::get<1>(ev);
+			const Vec3d &vTan = std::get<2>(ev);
+			const size_t base = size_t(vertIdx) * 3;
+			if (base + 2 >= g.dL_dpredicted.size()) continue;
+			double dot = 0.0;
+			for (int c = 0; c < 3; ++c) {
+				dot += (-vTan[c]) * (h * g.dL_dpredicted[base + c]);
+			}
+			perPrim[primIdx] += dot;
+		}
+		// OptimizeHelper indexes dL_dmu POSITIONALLY over
+		// taskInfo.mu_primitives, so emit one entry per requested
+		// primitive -- including zeros for primitives that saw no
+		// contact this step. Returning a short (or empty) vector would
+		// be read out of range by the optimizer.
+		ret.dL_dmu.clear();
+		for (int primIdx : taskInfo.mu_primitives) {
+			auto it = perPrim.find(primIdx);
+			ret.dL_dmu.emplace_back(primIdx, it == perPrim.end() ? 0.0 : it->second);
+		}
 	}
 	for (int t = 0; t < Constraint::CONSTRAINT_NUM && t < 4; ++t) {
 		ret.dL_dk_pertype[t] =
@@ -5452,11 +5524,21 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 					continue;
 				}
 				BackwardInformation avbdRet = stepBackwardAvbd(
-						taskConfiguration, dL_dxinit, record);
+						taskConfiguration, dL_dxinit, record,
+						// mu perturbs v at idx-1; its influence arrives
+						// through this step's predictor.
+						idx >= 1 ? &forwardRecords[idx - 1] : nullptr);
 				for (int t = 0; t < Constraint::CONSTRAINT_NUM && t < 4; ++t) {
 					avbdRet.dL_dk_pertype[t] += derivative.dL_dk_pertype[t];
 				}
 				avbdRet.dL_ddensity += derivative.dL_ddensity;
+				// dL/dmu accumulates across steps like the other parameter
+				// gradients: each step contributes the friction it applied.
+				// Positional over taskInfo.mu_primitives on both sides.
+				for (size_t m = 0; m < avbdRet.dL_dmu.size() &&
+						m < derivative.dL_dmu.size(); ++m) {
+					avbdRet.dL_dmu[m].second += derivative.dL_dmu[m].second;
+				}
 				if (avbdRet.dL_dxfixed_accum.rows() ==
 						derivative.dL_dxfixed_accum.rows()) {
 					avbdRet.dL_dxfixed_accum =
@@ -5512,12 +5594,20 @@ std::vector<Simulation::BackwardInformation> Simulation::runBackwardTask(
 				}
 			}
 			BackwardInformation avbdRet =
-					stepBackwardAvbd(taskConfiguration, dL_dx_in, record);
+					stepBackwardAvbd(taskConfiguration, dL_dx_in, record,
+					idx >= 1 ? &forwardRecords[idx - 1] : nullptr);
 			// Accumulate per-type stiffness, density, anchor cotangents.
 			for (int t = 0; t < Constraint::CONSTRAINT_NUM && t < 4; ++t) {
 				avbdRet.dL_dk_pertype[t] += derivative.dL_dk_pertype[t];
 			}
 			avbdRet.dL_ddensity += derivative.dL_ddensity;
+			// dL/dmu accumulates across steps like the other parameter
+			// gradients: each step contributes the friction it applied.
+			// Positional over taskInfo.mu_primitives on both sides.
+			for (size_t m = 0; m < avbdRet.dL_dmu.size() &&
+					m < derivative.dL_dmu.size(); ++m) {
+				avbdRet.dL_dmu[m].second += derivative.dL_dmu[m].second;
+			}
 			if (avbdRet.dL_dxfixed_accum.rows() ==
 					derivative.dL_dxfixed_accum.rows()) {
 				avbdRet.dL_dxfixed_accum =

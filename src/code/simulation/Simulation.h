@@ -48,6 +48,7 @@ namespace cloth { class MetalCGSolver; class AvbdSolver; }
 #include "Spring.h"
 #include "Triangle.h"
 #include "TriangleBending.h"
+#include <tuple>
 #include <Eigen/Core>
 #include <Eigen/Sparse>
 #include <iomanip>
@@ -109,6 +110,16 @@ public:
 		VecXd x_fixedpoints;
 		Vec5d windParams;
 		completeCollisionInfo collisionInfos;
+
+		// Per-contact friction sensitivity, recorded by the AVBD path so
+		// its adjoint can produce dL/dmu. The friction update is an
+		// explicit closed-form map applied after the solve:
+		//   v_rel_after = (1 - clamp(mu,0,1)) * v_tan_rel + max(vn,0) * n
+		// so mu enters through exactly one term and
+		//   d v_new / d mu = -v_tan_rel   (zero where the clamp saturates).
+		// Storing v_tan_rel per contact is therefore the whole Jacobian.
+		// Tuple: (primitive index, vertex index, v_tan_rel).
+		std::vector<std::tuple<int, int, Vec3d>> frictionSensitivity;
 		TimerContent timer;
 		std::vector<TimerEntry> accumTimer;
 		std::vector<Spline> splines;
@@ -632,7 +643,11 @@ public:
 	BackwardInformation stepBackwardAvbd(
 			const Simulation::BackwardTaskInformation &taskInfo,
 			const VecXd &dL_dx_new,
-			const ForwardInformation &forwardInfo_new);
+			const ForwardInformation &forwardInfo_new,
+			// Previous step's record, for the friction adjoint: mu
+			// perturbs v_{idx-1}, which reaches the loss through this
+			// step's predictor. Null disables the dL/dmu term.
+			const ForwardInformation *forwardInfo_prev = nullptr);
 
 	void resetForwardRecordsFromFolder(std::string subFolder) {
 		std::vector<Vec3d> modelPoints;
