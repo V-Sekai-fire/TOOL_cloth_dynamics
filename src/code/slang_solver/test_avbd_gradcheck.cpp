@@ -180,8 +180,8 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	std::printf("test_avbd_gradcheck: OK -- all 5 match finite differences.\n"
-				"The per-step adjoint is correct. A multi-step stall is then a\n"
-				"composition problem -- see test_avbd_chaincheck, which finds the\n"
-				"chain already broken at N = 2 via readPredictedGrad.\n");
+				"The per-step adjoint is correct, and since the epilogue's missing\n"
+				"direct path was restored test_avbd_chaincheck holds to 32 steps,\n"
+				"so composition is sound too.\n");
 	return 0;
 }

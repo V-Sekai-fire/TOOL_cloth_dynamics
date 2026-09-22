@@ -9,10 +9,9 @@ require LeanSlang from git
 -- Property testing for the AVBD specs (Cloth.Avbd.*). The existing
 -- `native_decide` examples pin single fixtures; plausible quantifies
 -- the same invariants over generated meshes, which is where a role or
--- offset bug would actually show up. Pinned to v4.29.0 to match this
--- project's lean-toolchain (v4.29.1) -- note plausible-witness-dag
--- itself requires v4.30.0, so adopting its ladder needs a toolchain
--- bump and is deliberately not done here.
+-- offset bug would actually show up. Pinned to v4.30.0, matching this
+-- project's lean-toolchain, which was bumped to v4.30.0 precisely so
+-- plausible-witness-dag's ladder could be adopted below.
 require plausible from git
   "https://github.com/leanprover-community/plausible" @ "v4.30.0"
 

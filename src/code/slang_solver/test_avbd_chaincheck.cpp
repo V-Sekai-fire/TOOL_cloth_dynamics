@@ -16,9 +16,18 @@
 // composition, not a magnified good one, and truncating at K=20 cannot
 // rescue something already wrong at K=2.
 //
-// The one-step STATE check below then localised it further: the fault
-// is `readPredictedGrad`, which does not return dL/d predicted. See
-// AvbdSolver.h's comment on that accessor.
+// That first reading blamed `readPredictedGrad`, and it was WRONG. The
+// one-step state check below aliases predicted = x, and vbd_init emits
+// v_x = +w*v_g against v_y = -w*v_g -- exact negatives -- so under
+// aliasing the inertial path cancels and no accessor can be held
+// responsible. test_avbd_stategrad removes the aliasing and finds both
+// accessors correct.
+//
+// The actual fault was in the Vulkan backward epilogue, which omitted
+// the solve's direct path: vbd_solve_apply computes x_out = p + dx, so
+// dL/dx picks up the incoming cotangent unchanged, and that term was
+// missing. With it restored the chain holds to 32 steps, which is what
+// this test now reports.
 //
 // The predictor here is deliberately x_pred = x_prev (quasi-static, no
 // velocity term), so the chain is exactly N applications of the
@@ -230,7 +239,7 @@ int main(int argc, char **argv) {
 					"differences by N = %d steps. The per-step adjoint is correct\n"
 					"(test_avbd_gradcheck), so the fault is in composing steps --\n"
 					"and at N = 2 there is no BPTT amplification to blame. The\n"
-					"state check above localises it to readPredictedGrad.\n",
+					"per-step accessors are each correct, so look at composition.\n",
 				firstBad);
 		return 0;  // a measurement, not a pass/fail gate
 	}

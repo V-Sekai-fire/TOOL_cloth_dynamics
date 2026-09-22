@@ -2,6 +2,7 @@ import Cloth.Avbd.AdjacencySpring
 import Cloth.Avbd.AdjacencyKwise
 import Cloth.Avbd.Coloring
 import Cloth.Avbd.CsrProperties
+import Cloth.Avbd.SpringHessAdjoint
 import Cloth.Avbd.ColoringProperties
 
 /-!

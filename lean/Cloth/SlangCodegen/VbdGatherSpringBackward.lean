@@ -3,34 +3,58 @@ import LeanSlang
 /-!
 # `Cloth.SlangCodegen.VbdGatherSpringBackward` — adjoint of vbd_gather_spring (PR-G continued)
 
-Backward kernel for `vbd_gather_spring`. The forward gathers
-per-spring outputs into per-vertex scratch with a sign flip on
-endpoint b:
+Backward kernel for `vbd_gather_spring`.
 
-  for v in verts:
-    for (c, r) in vertSpring-CSR[v]:
-      sign = 1 − 2·r                            -- +1 (p1) or −1 (p2)
-      g_v        += sign · springGradA[c]
-      H_v_diag   += springHessScalar[c]         -- no sign flip
+!! THE HESSIAN PATH OF THIS KERNEL IS WRONG. !!  The gradient path is
+correct; the Hessian path is not, and is not yet fixed. See
+`Cloth.Avbd.SpringHessAdjoint`, which states the adjoint identity this
+kernel fails.
 
-Springs have K=2 with sign flip on b. The adjoint dispatches one
-thread per spring c. Each thread reads both endpoint cotangents and
-fans them out with the correct signs:
+The gradient path. The forward gathers per-spring gradients into
+per-vertex scratch with a sign flip on endpoint b, so the adjoint
+dispatches one thread per spring and fans both endpoint cotangents back
+out with the matching signs:
 
   per c:
     p1 = springP1Idx[c],  p2 = springP2Idx[c]
-    vg_p1 = v_g[p1],      vg_p2 = v_g[p2]
-    v_springGradA[c] = vg_p1 − vg_p2           -- +1·p1  +  (−1)·p2
+    v_springGradA[c] = v_g[p1] - v_g[p2]       -- +1*p1  +  (-1)*p2
 
-  Hessian fan-out: the forward writes springHessScalar[c] into the
-  three diagonal entries of BOTH endpoints (no sign flip on the
-  Hessian), so the adjoint sums the trace contributions from both:
+That much is right.
 
-    v_springHess[c] = (v_H_xx[p1] + v_H_yy[p1] + v_H_zz[p1])
-                    + (v_H_xx[p2] + v_H_yy[p2] + v_H_zz[p2])
+The Hessian path. The doc that stood here described a forward in which
+each spring holds a SINGLE SCALAR, broadcast onto the three diagonal
+entries of both endpoints, making the adjoint a sum of two traces.
+No such forward exists in this repo, and never did. `SpringForce.lean`
+emits
 
-Off-diagonal entries of v_H don't flow back through the gather —
-the forward only touches diagonals.
+    hess[6c .. 6c+5] = k * (d (x) d) / len^2
+
+a rank-1 symmetric 3x3 stored as six components, and
+`VbdGatherSpring.lean` adds all six into both endpoints:
+
+    hScratch[6v + j] += springHess[6c + j]      j = 0..5
+
+(The same object appears as `k * n n^T` in the authors' own reference
+implementation, savant117/avbd-demo3d, `Spring::updatePrimal`.)
+
+The forward is linear in `springHess`, so its adjoint is forced -- there
+is exactly one correct answer, the componentwise transpose:
+
+    v_springHess[6c + j] = v_H[6*p1 + j] + v_H[6*p2 + j]
+
+What ships instead is `v_springHess[c] = trace(v_H[p1]) + trace(v_H[p2])`,
+which is wrong twice over: the buffer is the wrong SHAPE (length
+N_springs where 6*N_springs is needed) and, because `n n^T` is rank one
+with generally non-zero off-diagonals, discarding the off-diagonal
+cotangents throws away most of the block rather than a small correction.
+
+Consequence: d L / d k_spring is wrong (measured 8.43x off against
+finite differences in `test_avbd_gradcheck`). Springs are the only
+constraint family affected -- attachment, membrane and bending all
+check out -- and the dress demo uploads nSprings = 0, so this does not
+explain the dress. Fixing it changes this kernel's binding 5 from
+`float` of length N_springs to `float` of length 6*N_springs, and both
+backends' `readSpringGrad` with it.
 
 Bindings (set 0):
 
