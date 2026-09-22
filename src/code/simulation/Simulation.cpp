@@ -1642,6 +1642,32 @@ void Simulation::step() {
 		            driftMaxVert, "xyz"[driftMaxAxis],
 		            convergeMax, convergeMean, nanCount);
 
+		// AVBD_DUMP_SCRATCH=<N> reports the per-vertex gradient and
+		// Hessian magnitudes the solve actually saw at step N. This
+		// discriminates the two ways vbd_solve_apply can return
+		// dx == 0: g is zero (nothing to solve) versus H is enormous
+		// (det huge, invDet underflows). The dress freezes with
+		// dx == 0 exactly and this says which.
+		if (const char *ds = std::getenv("AVBD_DUMP_SCRATCH")) {
+			if (forwardRecords.size() == size_t(std::atoll(ds))) {
+				std::vector<float> gS, hS;
+				sysMat[0].avbd->readScratch(gS, hS);
+				double gMax = 0.0, hMax = 0.0, hMin = 1e300;
+				for (float x : gS) gMax = std::max(gMax, double(std::fabs(x)));
+				for (size_t q = 0; q + 5 < hS.size(); q += 6) {
+					for (int d = 0; d < 3; ++d) {
+						const double hd = double(hS[q + (d == 0 ? 0 : (d == 1 ? 3 : 5))]);
+						hMax = std::max(hMax, hd);
+						hMin = std::min(hMin, hd);
+					}
+				}
+				std::printf("[avbd-scratch] step %zu  max|g|=%g  diag(H) min=%g max=%g"
+				            "  -> dx ~ |g|/H ~ %g\n",
+				            forwardRecords.size(), gMax, hMin, hMax,
+				            hMax > 0.0 ? gMax / hMax : -1.0);
+			}
+		}
+
 		// Outlier topology snapshot. Per-vertex incident-triangle
 		// count + max |inv_deltaUV_ij| across the vertex's incident
 		// triangles. A vertex with very few incident triangles (1-2)
