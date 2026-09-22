@@ -787,9 +787,15 @@ namespace {
 struct VbdInitParams {
 	float invHSquared;
 	uint32_t colorOffset;
+	// MUST match the kernel's params struct exactly. The kernels gained
+	// a `count` field with the tid bounds guard; omitting it here left
+	// them reading the guard bound past the end of an undersized
+	// uniform buffer.
+	uint32_t count;
 };
 struct VbdGatherParams {
 	uint32_t colorOffset;
+	uint32_t count;
 };
 struct VbdSolveApplyParams {
 	uint32_t colorOffset;
@@ -1248,10 +1254,10 @@ int AvbdSolver::step() {
 		const uint32_t count = d.colorCount[c];
 		if (count == 0) continue;
 
-		const VbdInitParams ip{d.invHSqCached, offset};
+		const VbdInitParams ip{d.invHSqCached, offset, count};
 		if (!d.dispatch(cmd, "vbd_init", count, &ip, sizeof(ip))) return -1;
 
-		const VbdGatherParams gp{offset};
+		const VbdGatherParams gp{offset, count};
 
 		// The force kernels run over ALL constraints on every color, not
 		// just this color's: they must observe positions already updated
@@ -1532,7 +1538,7 @@ int AvbdSolver::stepBackward(const float *v_positions_loss) {
 	// reusing the FORWARD gather kernels -- their role buffers already
 	// carry the per-corner sign convention. colorOffset 0 and a full nV
 	// dispatch: coloring is irrelevant for an additive scatter.
-	const VbdGatherParams gz{0u};
+	const VbdGatherParams gz{0u, d.nVerts};
 	if (d.nSprings &&
 			!d.dispatch(cmd, "vbd_gather_spring", d.nVerts, &gz, sizeof(gz),
 					{{"springGradA", &d.vSpringPd},
@@ -1560,14 +1566,27 @@ int AvbdSolver::stepBackward(const float *v_positions_loss) {
 
 	if (!d.endAndWait(cmd)) return -1;
 
-	// Host epilogue: fold in the inertial term's position cotangent.
+	// Host epilogue. Two contributions land on dL/dx here.
+	//
+	// 1. The inertial path, v_x = w * v_g from vbd_init_backward.
+	//
+	// 2. The DIRECT path. vbd_solve_apply computes
+	//    positions[v] = p + dx, so x_out depends on x through the
+	//    identity as well as through g, and dL/dx picks up the
+	//    incoming cotangent v_out unchanged. This term was missing,
+	//    which is why dL/dx was wrong even with no constraints at all:
+	//    with inertia alone H = w*I and dx = predicted - x, so
+	//    x_out = predicted exactly and dL/dx must be ZERO -- it comes
+	//    out as v_out + w*v_g, the two cancelling. Dropping v_out left
+	//    exactly -v_out behind.
 	{
 		float *grad = d.vPositionsGrad.f32();
 		const float *init = d.vPositionsInit.f32();
+		const float *vout = d.vPositionsLoss.f32();
 		for (uint32_t i = 0; i < d.nVerts; ++i) {
-			grad[4 * i + 0] += init[4 * i + 0];
-			grad[4 * i + 1] += init[4 * i + 1];
-			grad[4 * i + 2] += init[4 * i + 2];
+			for (int c = 0; c < 3; ++c) {
+				grad[4 * i + c] += init[4 * i + c] + vout[4 * i + c];
+			}
 		}
 	}
 	return 0;

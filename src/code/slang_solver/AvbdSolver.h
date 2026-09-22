@@ -258,22 +258,27 @@ public:
     // wind flows through the AVBD forward, which would make this the
     // upstream cotangent for wind / external-force inverse design.
     //
-    // MEASURED NOT TO BE THAT. test_avbd_chaincheck.cpp finite-
-    // differences the one-step loss against the input positions: every
-    // component where this accessor returns ZERO matches through
-    // `readPositionsGrad` alone to ~1e-4, and every component where it
-    // returns non-zero disagrees with the finite difference under both
-    // `positionsGrad` and `positionsGrad + predictedGrad`. So
-    // `positionsGrad` is right and this value is some other quantity.
+    // THE KERNEL IS CORRECT -- do not repeat the mistake of blaming it.
+    // vbd_init computes g = w·(x − predicted) with w = m·invH², and
+    // vbd_init_backward emits v_x = +w·vg, v_y = −w·vg. That is exactly
+    // ∂L/∂x and ∂L/∂predicted through the inertial term. An earlier
+    // revision of this comment claimed the opposite, on the strength of
+    // a harness whose own model was incomplete.
     //
-    // The Metal buffer behind it is named `bufVPredictedJunk`. An
-    // earlier revision of this comment asserted that name was stale;
-    // the measurement says the NAME was accurate and the assertion was
-    // not. What `vbd_init_backward`'s `v_y` output actually represents
-    // is still open -- `vbd_init` computes g = w·(x − predicted) with
-    // w = m·invH², so ∂L/∂predicted should be −w·∂L/∂g, and a dropped
-    // sign or weight is the obvious suspect.
+    // WHAT IS UNRESOLVED is the host-side composition. A one-step
+    // finite-difference of the loss against the input positions
+    // (test_avbd_chaincheck) does not match
+    // `positionsGrad + predictedGrad` on any component where
+    // predictedGrad is non-zero, while every component where it is zero
+    // matches through positionsGrad alone. At least one term is
+    // missing: the solve is x_out = x_in + Δx, so ∂L/∂x_in carries an
+    // identity contribution from ∂L/∂x_out, and positionsGrad is
+    // assembled from the constraint scatter plus v_x only -- it does not
+    // appear to include it.
     //
+    // So: correct kernels, and a composition that no caller currently
+    // gets right. Establish the right composition against the one-step
+    // finite difference before chaining this across steps.
     // DO NOT build a gradient on this until it is resolved. Layout:
     // xyz tightly packed; length `3*nVerts`.
     void readPredictedGrad(std::vector<float>& predicted_grad) const;
