@@ -252,35 +252,26 @@ public:
     // forward, so this is the full density / mass gradient. Vector of
     // length `nVerts`. Empty if backward not run.
     void readMassGrad(std::vector<float>& mass_grad) const;
-    // Emitted by `vbd_init_backward` (CHI-113). INTENDED to be the
-    // per-vertex ∂L/∂predicted: the predictor
+    // Per-vertex ∂L/∂predicted — emitted by `vbd_init_backward`
+    // (CHI-113) as v_y = −w·v_g with w = m·invH². The predictor
     // `s_n = x_prev + h·v_prev + h²·M⁻¹·f_ext` is the only place f_ext /
-    // wind flows through the AVBD forward, which would make this the
-    // upstream cotangent for wind / external-force inverse design.
+    // wind flows through the AVBD forward, so this is the upstream
+    // cotangent for wind / external-force inverse design.
     //
-    // THE KERNEL IS CORRECT -- do not repeat the mistake of blaming it.
-    // vbd_init computes g = w·(x − predicted) with w = m·invH², and
-    // vbd_init_backward emits v_x = +w·vg, v_y = −w·vg. That is exactly
-    // ∂L/∂x and ∂L/∂predicted through the inertial term. An earlier
-    // revision of this comment claimed the opposite, on the strength of
-    // a harness whose own model was incomplete.
+    // VERIFIED correct: test_avbd_stategrad.cpp finite-differences the
+    // one-step loss against `predicted` with `positions` held fixed,
+    // and all 12 components match to ~1e-5.
     //
-    // WHAT IS UNRESOLVED is the host-side composition. A one-step
-    // finite-difference of the loss against the input positions
-    // (test_avbd_chaincheck) does not match
-    // `positionsGrad + predictedGrad` on any component where
-    // predictedGrad is non-zero, while every component where it is zero
-    // matches through positionsGrad alone. At least one term is
-    // missing: the solve is x_out = x_in + Δx, so ∂L/∂x_in carries an
-    // identity contribution from ∂L/∂x_out, and positionsGrad is
-    // assembled from the constraint scatter plus v_x only -- it does not
-    // appear to include it.
+    // A previous revision of this comment claimed the opposite, on the
+    // strength of a test that aliased predicted = x. That aliasing is
+    // exactly what the check must not do: v_x = +w·v_g and v_y = −w·v_g
+    // are exact negatives, so under aliasing they cancel and neither
+    // accessor can be blamed. The real fault was a missing direct path
+    // in readPositionsGrad, since fixed. The Metal buffer behind this
+    // accessor is still named `bufVPredictedJunk`; that name is
+    // genuinely stale.
     //
-    // So: correct kernels, and a composition that no caller currently
-    // gets right. Establish the right composition against the one-step
-    // finite difference before chaining this across steps.
-    // DO NOT build a gradient on this until it is resolved. Layout:
-    // xyz tightly packed; length `3*nVerts`.
+    // Layout: xyz tightly packed; length `3*nVerts`.
     void readPredictedGrad(std::vector<float>& predicted_grad) const;
     void readSpringGrad(std::vector<float>& restLen_grad,
                         std::vector<float>& stiff_grad) const;

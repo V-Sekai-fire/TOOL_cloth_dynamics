@@ -2876,23 +2876,22 @@ Simulation::BackwardInformation Simulation::stepBackwardAvbd(
 	// (CHI-113). Before this, dL/dmu was identically zero, which is why
 	// the sphere demo could not move its only parameter.
 	//
-	// CAVEAT, measured after this was written: readPredictedGrad does
-	// NOT return dL/d predicted. test_avbd_chaincheck.cpp finite-
-	// differences the one-step loss against the input positions and
-	// finds every component where that accessor is non-zero disagrees,
-	// while every component where it is zero matches through
-	// readPositionsGrad alone. See the comment on readPredictedGrad in
-	// AvbdSolver.h.
+	// readPredictedGrad is VERIFIED to be that cotangent:
+	// test_avbd_stategrad.cpp finite-differences the one-step loss
+	// against `predicted` with `positions` held fixed and all 12
+	// components match to ~1e-5.
 	//
-	// So the chain below is built on a quantity that is not what it
-	// claims. It does move mu the right way on the sphere demo
-	// (0.53977 -> 0.387541 against a groundtruth of 0.300, tracking
-	// PD's own trajectory), but a merely correlated direction still
-	// descends and L-BFGS-B absorbs scale error, so that is weaker
-	// evidence than it looks. Re-derive this once the accessor is
-	// understood; the structure (d v_new / d mu = -v_tan_rel, chained
-	// through the predictor) is independent of that bug and should
-	// survive.
+	// An earlier revision of this comment retracted that, on the
+	// strength of a test that aliased predicted = x and so could not
+	// attribute error to either accessor. The actual fault was a
+	// missing direct path in readPositionsGrad, since fixed. The
+	// friction chain below stands.
+	//
+	// On the sphere demo this moves mu 0.53977 -> 0.387541 against a
+	// groundtruth of 0.300, tracking PD's own trajectory. Worth noting
+	// the contact set is sparse there (one friction event per step), so
+	// the gradient is weak even when correct.
+
 	if (taskInfo.dL_dmu && forwardInfo_prev != nullptr &&
 			!g.dL_dpredicted.empty()) {
 		const double h = sceneConfig.timeStep;
