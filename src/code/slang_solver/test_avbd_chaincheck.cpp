@@ -119,6 +119,75 @@ double analyticChain(cloth::AvbdSolver &s, float triK, int steps) {
 }
 
 }  // namespace
+// Smallest discriminating rung: is the STATE gradient right for ONE
+// step? The chain composes dL/dx_{k-1} = positionsGrad + predictedGrad.
+// If that sum matches a finite difference of the one-step loss with
+// respect to the input positions, the composition is sound and the
+// N=2 break lies in the solver; if it does not, the harness is at
+// fault. Twelve components, one step, seconds.
+int checkStateGradient(cloth::AvbdSolver &s, float triK) {
+	std::vector<float> pos(kPos0, kPos0 + 12);
+	uploadAll(s, pos, pos, triK);
+	if (s.step() != 0) return -1;
+	std::vector<float> xOut;
+	s.readPositions(xOut);
+	if (s.stepBackward(xOut.data()) != 0) return -1;
+
+	std::vector<float> gPos, gPred;
+	s.readPositionsGrad(gPos);
+	s.readPredictedGrad(gPred);
+
+	std::printf("  %-4s %13s %13s %13s %11s  %s\n", "i", "posGrad", "predGrad",
+			"fd", "rel(sum)", "verdict");
+	std::printf("  --------------------------------------------------------------------\n");
+
+	const double h = 1e-3;
+	int bad = 0, badPosOnly = 0;
+	for (int i = 0; i < 12; ++i) {
+		std::vector<float> hi(kPos0, kPos0 + 12), lo(kPos0, kPos0 + 12);
+		hi[i] = float(double(hi[i]) + h);
+		lo[i] = float(double(lo[i]) - h);
+
+		uploadAll(s, hi, hi, triK);
+		if (s.step() != 0) return -1;
+		std::vector<float> xh;
+		s.readPositions(xh);
+		double Lh = 0.0;
+		for (float v : xh) Lh += 0.5 * double(v) * double(v);
+
+		uploadAll(s, lo, lo, triK);
+		if (s.step() != 0) return -1;
+		std::vector<float> xl;
+		s.readPositions(xl);
+		double Ll = 0.0;
+		for (float v : xl) Ll += 0.5 * double(v) * double(v);
+
+		const double fd = (Lh - Ll) / (2.0 * h);
+		const double gp = (size_t(i) < gPos.size()) ? double(gPos[i]) : 0.0;
+		const double gq = (size_t(i) < gPred.size()) ? double(gPred[i]) : 0.0;
+		const double denom = std::max(1.0, std::fabs(fd));
+		const double relSum = std::fabs((gp + gq) - fd) / denom;
+		const double relPos = std::fabs(gp - fd) / denom;
+		if (relSum >= 0.05) ++bad;
+		if (relPos < 0.05) ++badPosOnly;
+		std::printf("  %-4d %13.6g %13.6g %13.6g %11.3g  %s\n", i, gp, gq, fd, relSum,
+				relSum < 0.05 ? "ok" : (relPos < 0.05 ? "posGrad ALONE matches" : "MISMATCH"));
+	}
+	std::printf("\n");
+	if (bad == 0) {
+		std::printf("  => composition is sound: positionsGrad + predictedGrad is\n"
+					"     dL/dx_in. The N=2 break is in the solver, not the harness.\n\n");
+	} else if (badPosOnly == 12) {
+		std::printf("  => positionsGrad ALONE is dL/dx_in: it already folds in the\n"
+					"     predictor path, so adding predictedGrad double-counts.\n"
+					"     The harness was wrong, not the solver.\n\n");
+	} else {
+		std::printf("  => %d of 12 components disagree either way; neither\n"
+					"     composition is dL/dx_in.\n\n", bad);
+	}
+	return bad;
+}
+
 
 int main(int argc, char **argv) {
 	const char *dir = (argc > 1) ? argv[1] : ".";
@@ -130,6 +199,9 @@ int main(int argc, char **argv) {
 
 	const float triK = 1.0f;
 	const double h = 1e-3;
+
+	std::printf("test_avbd_chaincheck: one-step STATE gradient check first\n\n");
+	checkStateGradient(solver, triK);
 
 	std::printf("test_avbd_chaincheck: dL/d k_tri accumulated over N chained steps\n");
 	std::printf("  4 vertices, quasi-static predictor, central differences\n\n");
