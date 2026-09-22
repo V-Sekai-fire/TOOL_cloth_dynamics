@@ -1382,10 +1382,12 @@ void Simulation::step() {
 	// matches PD, a follow-up PR flips the switch to actually drive
 	// the simulation from AVBD.
 	if (g_useAvbd && currentSysmatId == 0 && sysMat[0].avbd && sysMat[0].avbd->ok()) {
-		// AVBD_ITERS=N (default 1) controls how many AVBD outer
+		// AVBD_ITERS=N (default 16) controls how many AVBD outer
 		// iterations run per Simulation::step(). Real convergence
-		// needs ~4-50 iters depending on stiffness; 1 is the
-		// shadow-timing baseline.
+		// needs ~4-50 iters depending on stiffness. The default was
+		// 1 while AVBD was a shadow-timing path only; 1 does not
+		// converge, so it is no longer a defensible default now that
+		// AVBD drives the simulation.
 		const int s_avbdIters = avbdCfg().iters;
 		// AVBD_DAMP scales velocity contribution in the AVBD predictor.
 		// Tests the hypothesis that dress's per-vertex GS oscillation

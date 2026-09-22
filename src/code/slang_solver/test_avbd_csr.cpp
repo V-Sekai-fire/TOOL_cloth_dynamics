@@ -29,7 +29,8 @@
 //                is negative-controlled.
 //
 // Build:
-//   clang++ -std=c++17 -I. -I<witness>/include -I<doctest> \
+//   clang++ -std=c++17 -I. \
+//     -I../../../external/doctest -I../../../external/witness-cpp/include \
 //       test_avbd_csr.cpp -o test_avbd_csr
 // Needs no Eigen, no Vulkan, no GPU.
 

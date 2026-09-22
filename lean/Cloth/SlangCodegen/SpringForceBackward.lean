@@ -88,7 +88,15 @@ private def body : List SlangStmt :=
   , .declInit f  "k"      (.index (.var "stiffness") (.var "i"))
   , .declInit f  "L"      (.index (.var "restLen")   (.var "i"))
   , .declInit f3 "vG"     (.index (.var "v_gradA")   (.var "i"))
-  , .declInit f  "vH"     (.index (.var "v_springHess") (.var "i"))
+  -- Six Hessian cotangent components, matching the forward's packing
+  -- [xx, xy, xz, yy, yz, zz].
+  , .declInit u  "hbi"    (.bin "*" (.litUint 6) (.var "i"))
+  , .declInit f  "vH0"    (.index (.var "v_springHess") (.var "hbi"))
+  , .declInit f  "vH1"    (.index (.var "v_springHess") (.bin "+" (.var "hbi") (.litUint 1)))
+  , .declInit f  "vH2"    (.index (.var "v_springHess") (.bin "+" (.var "hbi") (.litUint 2)))
+  , .declInit f  "vH3"    (.index (.var "v_springHess") (.bin "+" (.var "hbi") (.litUint 3)))
+  , .declInit f  "vH4"    (.index (.var "v_springHess") (.bin "+" (.var "hbi") (.litUint 4)))
+  , .declInit f  "vH5"    (.index (.var "v_springHess") (.bin "+" (.var "hbi") (.litUint 5)))
   , .declInit f  "gScale" (.bin "/" (.bin "*" (.var "k") (.bin "-" (.var "len") (.var "L")))
                                     (.var "len"))
   , .declInit f  "dotVGd"
@@ -99,21 +107,66 @@ private def body : List SlangStmt :=
   , .declInit f  "len3"   (.bin "*" (.var "len") (.var "len2"))
   , .declInit f  "kLd"    (.bin "/" (.bin "*" (.var "k") (.bin "*" (.var "L") (.var "dotVGd")))
                                     (.var "len3"))
+  , .declInit f  "len4"   (.bin "*" (.var "len2") (.var "len2"))
+  -- S = sum_j vH[j] * (d (x) d)[j], the contraction of the Hessian
+  -- cotangent against the outer product the forward stores.
+  , .declInit f  "S"
+      (.bin "+"
+        (.bin "+"
+          (.bin "+"
+            (.bin "+"
+              (.bin "+" (.bin "*" (.var "vH0") (.bin "*" (.var "dx") (.var "dx")))
+                        (.bin "*" (.var "vH1") (.bin "*" (.var "dx") (.var "dy"))))
+              (.bin "*" (.var "vH2") (.bin "*" (.var "dx") (.var "dz"))))
+            (.bin "*" (.var "vH3") (.bin "*" (.var "dy") (.var "dy"))))
+          (.bin "*" (.var "vH4") (.bin "*" (.var "dy") (.var "dz"))))
+        (.bin "*" (.var "vH5") (.bin "*" (.var "dz") (.var "dz"))))
+  -- T_m = sum_j vH[j] * d(d_a d_b)/d(d_m), the numerator of the
+  -- d(hess)/d(d) path before the 1/len^2 scaling.
+  , .declInit f  "Tx"
+      (.bin "+"
+        (.bin "+" (.bin "*" (.var "vH0") (.bin "*" (.litFloat 2.0) (.var "dx")))
+                  (.bin "*" (.var "vH1") (.var "dy")))
+        (.bin "*" (.var "vH2") (.var "dz")))
+  , .declInit f  "Ty"
+      (.bin "+"
+        (.bin "+" (.bin "*" (.var "vH1") (.var "dx"))
+                  (.bin "*" (.var "vH3") (.bin "*" (.litFloat 2.0) (.var "dy"))))
+        (.bin "*" (.var "vH4") (.var "dz")))
+  , .declInit f  "Tz"
+      (.bin "+"
+        (.bin "+" (.bin "*" (.var "vH2") (.var "dx"))
+                  (.bin "*" (.var "vH4") (.var "dy")))
+        (.bin "*" (.var "vH5") (.bin "*" (.litFloat 2.0) (.var "dz"))))
+  , .declInit f  "hs"     (.bin "/" (.bin "*" (.litFloat 2.0) (.bin "*" (.var "k") (.var "S")))
+                                    (.var "len4"))
+  , .declInit f  "kOverLen2" (.bin "/" (.var "k") (.var "len2"))
   , .assign (.index (.var "v_p_d") (.var "i"))
       (.call "float3"
-        [ .bin "+" (.bin "*" (.var "gScale") (.member (.var "vG") "x"))
-                   (.bin "*" (.var "kLd") (.var "dx"))
-        , .bin "+" (.bin "*" (.var "gScale") (.member (.var "vG") "y"))
-                   (.bin "*" (.var "kLd") (.var "dy"))
-        , .bin "+" (.bin "*" (.var "gScale") (.member (.var "vG") "z"))
-                   (.bin "*" (.var "kLd") (.var "dz")) ])
+        [ .bin "+"
+            (.bin "+" (.bin "*" (.var "gScale") (.member (.var "vG") "x"))
+                      (.bin "*" (.var "kLd") (.var "dx")))
+            (.bin "-" (.bin "*" (.var "kOverLen2") (.var "Tx"))
+                      (.bin "*" (.var "hs") (.var "dx")))
+        , .bin "+"
+            (.bin "+" (.bin "*" (.var "gScale") (.member (.var "vG") "y"))
+                      (.bin "*" (.var "kLd") (.var "dy")))
+            (.bin "-" (.bin "*" (.var "kOverLen2") (.var "Ty"))
+                      (.bin "*" (.var "hs") (.var "dy")))
+        , .bin "+"
+            (.bin "+" (.bin "*" (.var "gScale") (.member (.var "vG") "z"))
+                      (.bin "*" (.var "kLd") (.var "dz")))
+            (.bin "-" (.bin "*" (.var "kOverLen2") (.var "Tz"))
+                      (.bin "*" (.var "hs") (.var "dz"))) ])
   , .assign (.index (.var "v_restLen") (.var "i"))
       (.bin "-" (.litFloat 0.0)
         (.bin "/" (.bin "*" (.var "k") (.var "dotVGd")) (.var "len")))
+  -- d(hess)/dk = (d (x) d)/len^2, so the stiffness cotangent picks up
+  -- S/len^2, not the bare trace it used to add.
   , .assign (.index (.var "v_stiffness") (.var "i"))
       (.bin "+"
         (.bin "/" (.bin "*" (.bin "-" (.var "len") (.var "L")) (.var "dotVGd")) (.var "len"))
-        (.var "vH"))
+        (.bin "/" (.var "S") (.var "len2")))
   ]
 
 def shader : SlangShaderModule :=
@@ -175,14 +228,27 @@ void main(uint3 tid : SV_DispatchThreadID) {
   float k = stiffness[i];
   float L = restLen[i];
   float3 vG = v_gradA[i];
-  float vH = v_springHess[i];
+  uint hbi = (6u * i);
+  float vH0 = v_springHess[hbi];
+  float vH1 = v_springHess[(hbi + 1u)];
+  float vH2 = v_springHess[(hbi + 2u)];
+  float vH3 = v_springHess[(hbi + 3u)];
+  float vH4 = v_springHess[(hbi + 4u)];
+  float vH5 = v_springHess[(hbi + 5u)];
   float gScale = ((k * (len - L)) / len);
   float dotVGd = (((vG.x * dx) + (vG.y * dy)) + (vG.z * dz));
   float len3 = (len * len2);
   float kLd = ((k * (L * dotVGd)) / len3);
-  v_p_d[i] = float3(((gScale * vG.x) + (kLd * dx)), ((gScale * vG.y) + (kLd * dy)), ((gScale * vG.z) + (kLd * dz)));
+  float len4 = (len2 * len2);
+  float S = ((((((vH0 * (dx * dx)) + (vH1 * (dx * dy))) + (vH2 * (dx * dz))) + (vH3 * (dy * dy))) + (vH4 * (dy * dz))) + (vH5 * (dz * dz)));
+  float Tx = (((vH0 * (2.000000 * dx)) + (vH1 * dy)) + (vH2 * dz));
+  float Ty = (((vH1 * dx) + (vH3 * (2.000000 * dy))) + (vH4 * dz));
+  float Tz = (((vH2 * dx) + (vH4 * dy)) + (vH5 * (2.000000 * dz)));
+  float hs = ((2.000000 * (k * S)) / len4);
+  float kOverLen2 = (k / len2);
+  v_p_d[i] = float3((((gScale * vG.x) + (kLd * dx)) + ((kOverLen2 * Tx) - (hs * dx))), (((gScale * vG.y) + (kLd * dy)) + ((kOverLen2 * Ty) - (hs * dy))), (((gScale * vG.z) + (kLd * dz)) + ((kOverLen2 * Tz) - (hs * dz))));
   v_restLen[i] = (0.000000 - ((k * dotVGd) / len));
-  v_stiffness[i] = ((((len - L) * dotVGd) / len) + vH);
+  v_stiffness[i] = ((((len - L) * dotVGd) / len) + (S / len2));
 }"
 
 example : LeanSlang.emit shader = expected := by native_decide

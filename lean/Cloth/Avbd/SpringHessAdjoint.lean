@@ -15,19 +15,26 @@ for v, for (c, r) in vertSpring-CSR[v]:
 It is linear in `springHess`, so its adjoint is forced: there is exactly
 one correct answer and it is the transpose.
 
-`vbd_gather_spring_backward` does not compute that transpose. Its own
-doc block describes a *different* forward — one where each spring holds
-a single scalar broadcast onto three diagonal entries:
+`vbd_gather_spring_backward` DID NOT compute that transpose. Its doc
+block described a *different* forward -- one where each spring holds a
+single scalar broadcast onto three diagonal entries:
 
 ```
 H_v_diag += springHessScalar[c]
 v_springHess[c] = trace(v_H[p1]) + trace(v_H[p2])
 ```
 
-No such forward exists in this repo. `VbdGatherSpring.lean` stores six
-independent components per spring, so `v_springHess` is the wrong
-*shape* (length `N_springs`, needs `6·N_springs`) and the trace is the
-wrong *value*. Off-diagonal cotangents are discarded outright.
+No such forward ever existed in this repo. `VbdGatherSpring.lean`
+stores six independent components per spring, so `v_springHess` was the
+wrong *shape* (length `N_springs`, needs `6*N_springs`) and the trace
+was the wrong *value*; off-diagonal cotangents were discarded outright.
+The downstream `spring_force_backward` compounded it, reading that
+scalar and omitting the `d(hess)/d(d)` path from `v_p_d` entirely.
+
+Both kernels have since been corrected, and this file is what pinned
+down what "correct" meant before either was touched. It is kept as a
+regression: if someone reintroduces a trace, or reshapes the buffer,
+the sweeps below fail.
 
 The discriminating statement is the adjoint identity: for a linear map
 `A`, an adjoint `A*` must satisfy

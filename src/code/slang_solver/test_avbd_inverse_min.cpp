@@ -44,10 +44,14 @@ constexpr int STEPS = 4;
 const float kPos0[12] = {0, 0, 0, 3, 0, 0, 0, 4, 0, 3, 4, 0};
 const float kMass[4] = {2, 1, 1, 1};
 
-// Springs are excluded: their Hessian-path cotangents are known wrong
-// (vbd_gather_spring_backward uses trace(v_H) instead of the
-// contraction, and v_p_d omits d(hess)/d(d)). Including them would
-// make this test fail for a reason it is not trying to measure.
+// Springs were excluded when this was written, because both of their
+// Hessian-path cotangents were wrong. Both are fixed now (see
+// Cloth.Avbd.SpringHessAdjoint and the two kernels it names), and
+// test_avbd_gradcheck matches finite differences on all five
+// parameters. The fixture is left spring-free anyway: it is deliberately
+// the smallest thing that can answer the question, and adding a
+// constraint family it does not need would only widen what a failure
+// could mean.
 void upload(cloth::AvbdSolver &s, const float *pos, const float *pred, float kTri) {
 	s.setupMesh(NV, pos, pred, kMass, 2.0f);
 	const uint32_t av[1] = {2};
