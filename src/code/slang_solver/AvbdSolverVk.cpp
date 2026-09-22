@@ -1287,12 +1287,45 @@ int AvbdSolver::step() {
 	return d.endAndWait(cmd) ? 0 : -1;
 }
 
+// AVBD's Eq. 16 penalty ramp, on top of the dual ascent. beta scales
+// how fast the penalty climbs with the constraint violation; the ramp is
+// clamped to the material stiffness so a constraint never becomes
+// stiffer than the material it models, and to penaltyMax as a hard
+// ceiling. Upstream's defaults are betaLin = 10000 and
+// PENALTY_MAX = 1e10 (avbd-demo3d solver.h:29, solver.cpp
+// defaultParams); the paper notes beta is scene- and unit-dependent and
+// suggests [1, 1000], so it is left tunable rather than baked in.
+//
+// AVBD_BETA=0 disables the ramp entirely, restoring the fixed-gamma
+// behaviour this kernel had before. That is the control arm: any claim
+// that the ramp helps has to survive being switched off.
+struct AttachmentDualUpdateParams {
+	float beta;
+	float penaltyMax;
+	uint32_t count;
+};
+
+// Deliberately NOT cached in a static. A cached value can only be set
+// once per process, which would force the ramp-on and ramp-off arms of
+// test_avbd_penalty_ramp into separate runs and make them incomparable.
+// One getenv per dual dispatch is nothing beside the dispatch itself.
+static float avbdBeta() {
+	if (const char *e = std::getenv("AVBD_BETA")) return float(std::atof(e));
+	return 10000.0f;
+}
+
+static float avbdPenaltyMax() {
+	if (const char *e = std::getenv("AVBD_PENALTY_MAX")) return float(std::atof(e));
+	return 1.0e10f;
+}
+
 int AvbdSolver::stepDualAttachments() {
 	if (!ok() || impl_->nAttach == 0) return 0;
 	Impl &d = *impl_;
 	VkCommandBuffer cmd = d.begin();
 	if (cmd == VK_NULL_HANDLE) return -1;
-	if (!d.dispatch(cmd, "attachment_dual_update", d.nAttach)) return -1;
+	const AttachmentDualUpdateParams p{avbdBeta(), avbdPenaltyMax(), d.nAttach};
+	if (!d.dispatch(cmd, "attachment_dual_update", d.nAttach, &p, sizeof(p))) return -1;
 	return d.endAndWait(cmd) ? 0 : -1;
 }
 

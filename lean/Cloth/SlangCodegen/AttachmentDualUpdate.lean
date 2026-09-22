@@ -58,31 +58,67 @@ private def bnd (n : Nat) (name : String) (t : SlangType) : SlangBinding :=
 
 private def body : List SlangStmt :=
   [ .declInit u  "c"   (.member (.var "tid") "x")
+  , .ifThen
+      (.bin ">=" (.var "c") (.member (.var "params") "count"))
+      [ .ret none ]
+      []
   , .declInit u  "v"   (.index (.var "vertIdx") (.var "c"))
   , .declInit f3 "p"   (.index (.var "positions") (.var "v"))
   , .declInit f3 "fp"  (.index (.var "fixedPos") (.var "c"))
   , .declInit f  "g"   (.index (.var "gamma") (.var "c"))
   , .declInit f3 "lam" (.index (.var "lambda") (.var "c"))
+  , .declInit f  "Cx"  (.bin "-" (.member (.var "p") "x") (.member (.var "fp") "x"))
+  , .declInit f  "Cy"  (.bin "-" (.member (.var "p") "y") (.member (.var "fp") "y"))
+  , .declInit f  "Cz"  (.bin "-" (.member (.var "p") "z") (.member (.var "fp") "z"))
   , .assign (.index (.var "lambda") (.var "c"))
       (.call "float3"
-        [ .bin "+" (.member (.var "lam") "x")
-            (.bin "*" (.var "g")
-              (.bin "-" (.member (.var "p") "x") (.member (.var "fp") "x")))
-        , .bin "+" (.member (.var "lam") "y")
-            (.bin "*" (.var "g")
-              (.bin "-" (.member (.var "p") "y") (.member (.var "fp") "y")))
-        , .bin "+" (.member (.var "lam") "z")
-            (.bin "*" (.var "g")
-              (.bin "-" (.member (.var "p") "z") (.member (.var "fp") "z"))) ])
+        [ .bin "+" (.member (.var "lam") "x") (.bin "*" (.var "g") (.var "Cx"))
+        , .bin "+" (.member (.var "lam") "y") (.bin "*" (.var "g") (.var "Cy"))
+        , .bin "+" (.member (.var "lam") "z") (.bin "*" (.var "g") (.var "Cz")) ])
+  -- Eq. 16: ramp the penalty by the constraint violation.
+  --
+  -- Upstream clamps to `min(stiffness, PENALTY_MAX)` and, for a finite
+  -- stiffness, does NOT update lambda -- a soft constraint is meant to
+  -- converge to its material stiffness, not to C = 0. This kernel
+  -- ascends lambda unconditionally, which makes an attachment an
+  -- effectively HARD constraint, so the matching clamp is the hard
+  -- ceiling alone. Clamping to the material stiffness here would also
+  -- be a no-op: the host seeds gamma from `stiffness`, so gamma would
+  -- start already at the cap.
+  --
+  -- Adopting upstream's soft-constraint rule is a modelling change (it
+  -- would let pinned vertices sag by mg/k) and is deliberately not made
+  -- here; it should be measured on its own.
+  --
+  -- Upstream also keeps a per-axis penalty vector and uses abs(C)
+  -- componentwise. gamma here is one scalar per constraint, so the
+  -- matching reduction is the magnitude |C|.
+  , .declInit f  "Cmag"
+      (.call "sqrt"
+        [ .bin "+"
+            (.bin "+" (.bin "*" (.var "Cx") (.var "Cx"))
+                      (.bin "*" (.var "Cy") (.var "Cy")))
+            (.bin "*" (.var "Cz") (.var "Cz")) ])
+  , .assign (.index (.var "gamma") (.var "c"))
+      (.call "min"
+        [ .bin "+" (.var "g")
+            (.bin "*" (.member (.var "params") "beta") (.var "Cmag"))
+        , .member (.var "params") "penaltyMax" ])
   ]
 
 def shader : SlangShaderModule :=
-  { globals :=
+  { structs :=
+      [ { name := "AttachmentDualUpdateParams"
+        , fields := [⟨"beta", f, Semantic.none, none, none, .qIn⟩
+            , ⟨"penaltyMax", f, Semantic.none, none, none, .qIn⟩
+            , ⟨"count", u, Semantic.none, none, none, .qIn⟩ ] } ]
+  , globals :=
       [ bnd 0 "positions" (.roBuf f3)
       , bnd 1 "vertIdx"   (.roBuf u)
       , bnd 2 "fixedPos"  (.roBuf f3)
-      , bnd 3 "gamma"     (.roBuf f)
+      , bnd 3 "gamma"     (.rwBuf f)
       , bnd 4 "lambda"    (.rwBuf f3)
+      , ⟨"params", .const "AttachmentDualUpdateParams", Semantic.none, some 5, some 0, .qIn⟩
       ]
   , functions := [{
       attrs  := [.shaderCompute, .numthreads 64 1 1]
@@ -94,26 +130,42 @@ def shader : SlangShaderModule :=
     }] }
 
 def expected : String :=
-"[[vk::binding(0, 0)]]
+"struct AttachmentDualUpdateParams {
+  float beta;
+  float penaltyMax;
+  uint count;
+};
+
+[[vk::binding(0, 0)]]
 StructuredBuffer<float3> positions;
 [[vk::binding(1, 0)]]
 StructuredBuffer<uint> vertIdx;
 [[vk::binding(2, 0)]]
 StructuredBuffer<float3> fixedPos;
 [[vk::binding(3, 0)]]
-StructuredBuffer<float> gamma;
+RWStructuredBuffer<float> gamma;
 [[vk::binding(4, 0)]]
 RWStructuredBuffer<float3> lambda;
+[[vk::binding(5, 0)]]
+ConstantBuffer<AttachmentDualUpdateParams> params;
 
 [shader(\"compute\")] [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
   uint c = tid.x;
+  if ((c >= params.count)) {
+    return;
+  }
   uint v = vertIdx[c];
   float3 p = positions[v];
   float3 fp = fixedPos[c];
   float g = gamma[c];
   float3 lam = lambda[c];
-  lambda[c] = float3((lam.x + (g * (p.x - fp.x))), (lam.y + (g * (p.y - fp.y))), (lam.z + (g * (p.z - fp.z))));
+  float Cx = (p.x - fp.x);
+  float Cy = (p.y - fp.y);
+  float Cz = (p.z - fp.z);
+  lambda[c] = float3((lam.x + (g * Cx)), (lam.y + (g * Cy)), (lam.z + (g * Cz)));
+  float Cmag = sqrt((((Cx * Cx) + (Cy * Cy)) + (Cz * Cz)));
+  gamma[c] = min((g + (params.beta * Cmag)), params.penaltyMax);
 }"
 
 example : LeanSlang.emit shader = expected := by native_decide

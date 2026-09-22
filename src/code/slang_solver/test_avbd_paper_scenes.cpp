@@ -3,25 +3,51 @@
 // Source: savant117/avbd-demo3d, `scenes.h` -- the authors' own demo.
 // Of its 14 scenes, 10 need rigid bodies, joints, tetrahedra or
 // in-solver contact manifolds, none of which this cloth solver has.
-// The 4 that DO port are the ones carrying the paper's actual claim:
-// that AVBD converges at stiffness and mass ratios where VBD does not.
 //
-//   Spring Ratio  sceneSpringsRatio  8 particles, ends pinned, springs
-//                                    alternating k = 10 / 10000 (1000x)
-//   Rope          sceneRope          20 particles, uniform, pinned head
-//   Heavy Rope    sceneHeavyRope     same, last particle 125x the mass
-//   Spring        sceneSpring        one spring from an anchor
+// FIDELITY, which decides what a result here is allowed to mean.
+// Upstream builds a link with either `Spring` (a soft penalty force,
+// Gauss-Newton Hessian k*n n^T, rank one) or `Joint` (a hard ball-socket
+// constraint whose Hessian is K = diagonal(penalty), full rank, with the
+// paper's Eq. 16 penalty ramp behind it). Only two scenes use `Spring`:
 //
-// A fifth scene, "Rope (pre-tensioned)", is not from scenes.h. It is a
-// controlled variant of Rope added to test an explanation of Rope's
-// result; see the comment on sceneRopeTensioned.
+//   Spring        scenes.h:109   FAITHFUL -- one spring from an anchor
+//   Spring Ratio  scenes.h:124   FAITHFUL -- 8 particles, ends pinned,
+//                                springs alternating k = 10 / 10000
 //
-// RESULT, recorded here because it is the point of the file: three of
-// the four ported scenes are FLAT -- the residual does not improve at
-// all between 1 and 256 iterations. The pre-tensioned control, same
-// topology and same springs, converges 337x over the same sweep. The
-// difference is whether the springs carry tension, which is exactly
-// what the dropped geometric-stiffness term supplies.
+// Rope and Heavy Rope use `Joint` (scenes.h:79, :97). This solver has no
+// joint constraint, so they are reproduced here with springs. That is an
+// ADAPTATION, not a port, and a bad result on them is partly a statement
+// about the substitution. They are kept because they are the topology
+// the pre-tensioned control varies against, not as evidence about the
+// paper:
+//
+//   Rope          20 particles, uniform, pinned head   (joints -> springs)
+//   Heavy Rope    same, last particle 125x the mass    (joints -> springs)
+//
+// A fifth scene, "Rope (pre-tensioned)", is not from scenes.h at all. It
+// is a controlled variant added to test an explanation; see the comment
+// on sceneRopeTensioned.
+//
+// RESULT. Of the two faithful scenes, Spring converges (190x over the
+// sweep) and Spring Ratio is completely FLAT -- its residual does not
+// improve at all between 1 and 256 iterations. The two adapted rope
+// scenes are flat too. The pre-tensioned control, identical topology and
+// the same springs as Rope, converges 337x.
+//
+// The difference throughout is whether the springs carry tension. The
+// Gauss-Newton Hessian k*n n^T is rank one, stiff only ALONG the spring;
+// transverse stiffness comes from the geometric-stiffness term, which
+// Gauss-Newton drops. Spring Ratio sits at exactly rest length with
+// gravity transverse, so its per-vertex blocks are singular in precisely
+// the direction it needs to move. Spring is stretched and loaded
+// axially, so it is fine.
+//
+// Note what this does NOT show. Upstream's `Spring` has the same rank-one
+// Hessian and no dual update at all, so nothing here says our springs
+// behave differently from the paper's -- only that a rest-length spring
+// chain is a configuration this Hessian cannot descend. The paper's own
+// answer for a link that must not collapse is `Joint`, i.e. a penalty
+// constraint with Eq. 16, which is the machinery this solver is missing.
 //
 // Build:
 //   clang++ -std=c++17 -I<vulkan>/Include -I. \
@@ -92,10 +118,11 @@ Scene sceneSpringsRatio() {
 	return s;
 }
 
-// scenes.h:69 -- uniform chain, head pinned. The control for Heavy Rope.
+// scenes.h:69 -- uniform chain, head pinned. Upstream links these with
+// Joint; springs are a substitution. See FIDELITY above.
 Scene sceneRope() {
 	Scene s;
-	s.name = "Rope";
+	s.name = "Rope (joints->springs)";
 	const int N = 20;
 	for (int i = 0; i < N; ++i) s.addVert(float(i), 0.0f, 10.0f, 1.0f);
 	for (int i = 1; i < N; ++i) s.addSpring(uint32_t(i - 1), uint32_t(i), 1.0f, 1000.0f);
@@ -105,10 +132,10 @@ Scene sceneRope() {
 
 // scenes.h:84 -- same chain, but the last body is a 5x5x5 cube against
 // 1x0.5x0.5 links: a mass ratio of 125 at the far end of a 20-link
-// chain. This is the paper's hard case.
+// chain. Upstream links these with Joint too; see FIDELITY above.
 Scene sceneHeavyRope() {
 	Scene s;
-	s.name = "Heavy Rope";
+	s.name = "Heavy Rope (joints->springs)";
 	const int N = 20;
 	for (int i = 0; i < N; ++i) {
 		s.addVert(float(i), 0.0f, 10.0f, (i == N - 1) ? 125.0f : 1.0f);

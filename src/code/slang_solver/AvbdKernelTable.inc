@@ -137,8 +137,9 @@ static const BindingDesc kBindings_attachment_dual_update[] = {
 	{ "positions", 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
 	{ "vertIdx", 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
 	{ "fixedPos", 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
-	{ "gamma", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
+	{ "gamma", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
 	{ "lambda", 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
+	{ "params", 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, true },
 };
 
 static const BindingDesc kBindings_triangle_membrane_dual_update[] = {
@@ -286,7 +287,7 @@ static const KernelDesc kKernels[] = {
 	{ "attachment_force_al", "main", { 64, 1, 1 }, kBindings_attachment_force_al, 7, -1 },
 	{ "triangle_membrane_force_al", "main", { 64, 1, 1 }, kBindings_triangle_membrane_force_al, 8, -1 },
 	{ "triangle_bending_force_al", "main", { 64, 1, 1 }, kBindings_triangle_bending_force_al, 8, -1 },
-	{ "attachment_dual_update", "main", { 64, 1, 1 }, kBindings_attachment_dual_update, 5, -1 },
+	{ "attachment_dual_update", "main", { 64, 1, 1 }, kBindings_attachment_dual_update, 6, 5 },
 	{ "triangle_membrane_dual_update", "main", { 64, 1, 1 }, kBindings_triangle_membrane_dual_update, 6, -1 },
 	{ "triangle_bending_dual_update", "main", { 64, 1, 1 }, kBindings_triangle_bending_dual_update, 6, -1 },
 	{ "self_collision_scan", "main", { 64, 1, 1 }, kBindings_self_collision_scan, 4, 3 },
