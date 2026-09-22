@@ -32,26 +32,6 @@
 
 double TriangleBending::k_stiff = 0.0;
 bool useEnergy1 = false;
-void TriangleBending::addConstraint(std::vector<Triplet> &tri, int &c_idx,
-		bool withWeight) {
-	if (withWeight) {
-		this->c_idx = c_idx;
-	} else {
-		this->c_weightless_idx = c_idx;
-	}
-
-	double weightUsed =
-			withWeight ? constrainWeightSqrt : std::sqrt(3.0 / (A0 + A1));
-
-	for (int dim = 0; dim < 3; dim++) {
-		for (int i = 0; i < 4; ++i) {
-			tri.emplace_back(c_idx + dim, idx_arr[i] * 3 + dim,
-					weightUsed * weightVert[i]);
-		}
-	}
-
-	c_idx += constraintNum;
-}
 
 double TriangleBending::evaluateEnergy(const VecXd &x_new) {
 	Vec3d proj = project(x_new);
@@ -201,17 +181,7 @@ Mat3x12d TriangleBending::backwardGradient(const VecXd &x_vec) {
 	return constrainWeightSqrt * de_normalized * n;
 }
 
-void TriangleBending::projectBackwardPrecompute(const VecXd &x_vec) {
-	grad = backwardGradient(x_vec).cast<float>();
-}
 
-void TriangleBending::projectBackward(const VecXd &x_vec,
-		TripleVector &triplets) {
-	insertIntoTriplets(triplets, grad, 3, 3, 0, 0, c_idx, p0_idx * 3);
-	insertIntoTriplets(triplets, grad, 3, 3, 0, 3, c_idx, p1_idx * 3);
-	insertIntoTriplets(triplets, grad, 3, 3, 0, 6, c_idx, p2_idx * 3);
-	insertIntoTriplets(triplets, grad, 3, 3, 0, 9, c_idx, p3_idx * 3);
-}
 
 TriangleBending::TriangleBending(int p0_idx, int p1_idx, int p2_idx, int p3_idx,
 		std::vector<Particle> &pArr) :

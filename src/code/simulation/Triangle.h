@@ -177,8 +177,6 @@ public:
 		return v0.cross(v1).normalized();
 	}
 
-	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
-			bool withWeight) override;
 
 	void addAvbdConstraint(AvbdAssembly &out) const override {
 		if (!out.membrane) return;  // AVBD_NO_MEMBRANE=1
@@ -198,13 +196,6 @@ public:
 	}
 
 	VecXd project(const VecXd &x_vec) const override;
-
-	void projectBackward(const VecXd &x_vec, TripleVector &triplets) override;
-
-	void projectBackwardPrecompute(const VecXd &x_vec) override;
-
-	VecXd dp_dk(const VecXd &x_vec) const override;
-
 	Mat6x9d projectToManifoldBackward(const VecXd &x_vec) const;
 
 	Mat3x2d getDeformationGradient(const VecXd &x_vec) const;

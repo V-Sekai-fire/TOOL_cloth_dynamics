@@ -186,27 +186,6 @@ namespace {
     }
 
 #ifdef __APPLE__
-    // Build a CSR (fp32, int32) snapshot of an Eigen sparse SPD matrix.
-    cloth::CSRSpMatF eigenToCSRf(const SpMat& P) {
-        cloth::CSRSpMatF csr;
-        csr.rows = uint32_t(P.rows());
-        // Force a column-major-to-CSR conversion: for SPD matrices
-        // column-major == row-major in CSR layout, but be explicit.
-        Eigen::SparseMatrix<double, Eigen::RowMajor> R = P;
-        R.makeCompressed();
-        const Eigen::Index nnz = R.nonZeros();
-        csr.rowPtr.resize(csr.rows + 1);
-        csr.colIdx.resize(size_t(nnz));
-        csr.values.resize(size_t(nnz));
-        for (Eigen::Index i = 0; i <= Eigen::Index(csr.rows); ++i) {
-            csr.rowPtr[size_t(i)] = int32_t(R.outerIndexPtr()[i]);
-        }
-        for (Eigen::Index k = 0; k < nnz; ++k) {
-            csr.colIdx[size_t(k)] = int32_t(R.innerIndexPtr()[k]);
-            csr.values[size_t(k)] = float(R.valuePtr()[k]);
-        }
-        return csr;
-    }
 #endif
 }
 
@@ -920,95 +899,6 @@ Simulation::calculateDryFrictionVector(const VecXd &f,
 	return std::make_pair(r, r_prim);
 }
 
-// ((dr_df, dr_dfprim), dr_ddensity)
-std::pair<std::pair<SpMat, SpMat>, VecXd>
-Simulation::calculatedr_df(const completeCollisionInfo &infos,
-		bool calculatePrimitiveGradient = false,
-		bool calculateDensityGradient = false) const {
-	int threeM = 3 * particles.size();
-	SpMat dr_df(threeM, threeM);
-	TripleVector dr_dftriplets;
-	SpMat drprim_dfprim(threeM, threeM);
-	VecXd dr_drho(threeM);
-	dr_drho.setZero();
-	dr_df.setZero();
-	drprim_dfprim.setZero();
-
-	if (contactEnabled) {
-		// primitive collisions
-
-		for (const PrimitiveCollisionInformation &info : infos.first.first) {
-			if (info.primitiveId != -1) {
-				int pIdx = info.particleId;
-				Primitive *prim = primitives[info.primitiveId];
-				Mat3x3d dri_dd = calculatedri_dfi(info.normal, info.d, prim->mu);
-				insertIntoTriplets<3, 3>(dr_dftriplets, dri_dd, 3 * pIdx, 3 * pIdx);
-				if (calculateDensityGradient) {
-					Vec3d dd_ddensity = -particles[pIdx].area * info.v_out;
-					dr_drho.segment(info.particleId * 3, 3) += dri_dd * dd_ddensity;
-				}
-			}
-		}
-
-		dr_df.setFromTriplets(dr_dftriplets.begin(), dr_dftriplets.end());
-
-		if (selfcollisionEnabled) {
-			int layerCount = 0;
-			double rho = sceneConfig.fabric.density;
-			for (const std::vector<SelfCollisionInformation> &selfInfos :
-					infos.second) { // has to use second, because 1. layer matters 2.
-				// info.d and info.r is only updated in second
-				layerCount++;
-				SpMat dr_df_last = dr_df;
-				TripleVector dr_df_delta;
-
-				for (const SelfCollisionInformation &info : selfInfos) {
-					int nA = info.particleId1;
-					int nB = info.particleId2;
-					double m_A = particles[nA].mass;
-					double m_B = particles[nB].mass;
-					double clothFrictionalCoeff = 0.1;
-
-					double k = (m_A * m_B) / (m_A + m_B);
-					Mat3x3d dcalc_dd =
-							calculatedri_dfi(info.normal, info.d, clothFrictionalCoeff);
-					Mat3x3d dr_dd = k * dcalc_dd;
-
-					Mat3x3d dr_dfiA = dr_dd / m_A;
-					Mat3x3d dr_dfiB = -dr_dd / m_B;
-
-					insertIntoTriplets<3, 3>(dr_df_delta, dr_dfiA, 3 * nA,
-							3 * nA); // drA_dfiA
-					insertIntoTriplets<3, 3>(dr_df_delta, dr_dfiB, 3 * nA,
-							3 * nB); // drA_dfiB
-					insertIntoTriplets33(dr_df_delta, -dr_dfiA, 3 * nB,
-							3 * nA); // drB_dfiA
-					insertIntoTriplets33(dr_df_delta, -dr_dfiB, 3 * nB,
-							3 * nB); // drB_dfiB
-
-					MatXd dfiA_df = dr_df_last.block(3 * nA, 0, 3, threeM);
-					MatXd dfiB_df = dr_df_last.block(3 * nB, 0, 3, threeM);
-
-					MatXd dr_dfiA_x_dfiA_df = dr_dfiA * dfiA_df; // 3x3m
-					MatXd dr_dfiB_x_dfiB_df = dr_dfiB * dfiB_df; // 3x3m
-					MatXd dr_dfprev = dr_dfiA_x_dfiA_df + dr_dfiB_x_dfiB_df;
-					MatXd negdr_dfprev = -dr_dfprev;
-
-					insertIntoTriplets(dr_df_delta, dr_dfprev, 3, threeM, 0, 0, 3 * nA,
-							0);
-					insertIntoTriplets(dr_df_delta, negdr_dfprev, 3, threeM, 0, 0, 3 * nB,
-							0);
-				}
-
-				dr_df.setFromTriplets(dr_df_delta.begin(), dr_df_delta.end());
-				dr_df += dr_df_last;
-			}
-		}
-	}
-
-	return std::make_pair(std::make_pair(dr_df, drprim_dfprim), dr_drho);
-}
-
 std::vector<VecXd> Simulation::calculatedr_dmu(
 		const std::vector<PrimitiveCollisionInformation> &infos,
 		const std::vector<int> &primIds) const {
@@ -1153,7 +1043,8 @@ Mat3x3d Simulation::calculatedri_dfi(const Vec3d &n, const Vec3d &f_i,
 }
 
 double Simulation::evaluateEnergy(const VecXd &x_new) const {
-	double inertia = 0.5 * (x_new - s_n).transpose() * M * (x_new - s_n);
+	const VecXd d_in = x_new - s_n;
+	double inertia = 0.5 * (d_in.array().square() * M.array()).sum();
 	double energy = 0;
 
 #pragma omp parallel for if (OPENMP_ENABLED)
@@ -1175,7 +1066,7 @@ double Simulation::evaluateSystemEnergy(const VecXd &v, const VecXd &x) const {
 	for (Constraint *c : sysMat[currentSysmatId].constraints) {
 		deformE += c->evaluateEnergy(x);
 	}
-	double potentialE = 0.5 * v.transpose() * M * v;
+	double potentialE = 0.5 * (v.array().square() * M.array()).sum();
 	std::printf("systemE: %.8f deformE: %.8f potentialE: %.8f\n",
 			deformE + potentialE, deformE, potentialE);
 	return deformE + potentialE;
@@ -1312,13 +1203,11 @@ void Simulation::step() {
 		if (forwardRecords.size() >= sysMat[i].startFrameNum) {
 			if ((currentSysmatId != i) || (forwardRecords.size() == 1)) {
 				currentSysmatId = i;
-				projections = VecXd(sysMat[currentSysmatId].constraintNum);
-				projections.setZero();
-				for (int j = 0; j < Constraint::CONSTRAINT_NUM; j++) {
-					projections_pertype[j] =
-							VecXd(sysMat[currentSysmatId].constraintNum_pertype[j]);
-					projections_pertype[j].setZero();
-				}
+				// `projections` / `projections_pertype` were sized here
+				// from constraintNum and read only by PD's CG loop. With
+				// the loop gone nothing reads them, and with the triplet
+				// walk gone nothing SETS constraintNum either -- so this
+				// was sizing a vector from uninitialised memory.
 			}
 
 			break;
@@ -2254,10 +2143,10 @@ Simulation::BackwardInformation Simulation::stepBackwardAvbd(
 	// Extract per-vertex area from the 3N×3N diagonal sparse Area matrix.
 	// DiffCloth's Area has identical xyz blocks per vertex; sample x.
 	std::vector<double> vertex_area;
-	if (taskInfo.dL_density && Area.rows() >= int(3 * nV)) {
+	if (taskInfo.dL_density && Area.size() >= int(3 * nV)) {
 		vertex_area.resize(nV, 0.0);
 		for (uint32_t v = 0; v < nV; ++v) {
-			vertex_area[v] = Area.coeff(3 * v, 3 * v);
+			vertex_area[v] = Area[3 * v];
 		}
 	}
 
@@ -3567,14 +3456,15 @@ void Simulation::resetSystem(const std::pair<VecXd, VecXd> &x0v0) {
 };
 
 void Simulation::updateAreaMatrix() {
-	Area =
-			Eigen::SparseMatrix<double>(particles.size() * 3, particles.size() * 3);
-	Area.setZero();
-	Area_inv =
-			Eigen::SparseMatrix<double>(particles.size() * 3, particles.size() * 3);
-	Area_inv.setZero();
+	// Area and M were Eigen sparse matrices, but both are strictly
+	// DIAGONAL -- one entry per (vertex, axis) -- and were only ever used
+	// as a weighted dot product or read back one diagonal entry at a
+	// time. Storing 3N doubles instead of a sparse matrix of 3N nonzeros
+	// costs nothing in accuracy and removes the last use of
+	// Eigen::SparseMatrix from the simulation. Area_inv and M_inv were
+	// built here too and never read at all.
+	Area = VecXd::Zero(particles.size() * 3);
 
-	std::vector<Triplet> triplets, tripletsInv;
 	std::vector<double> area_per_particles(particles.size(), 0);
 
 	for (Triangle &t : mesh) {
@@ -3592,19 +3482,13 @@ void Simulation::updateAreaMatrix() {
 	for (Particle &p : particles) {
 		p.area = area_per_particles[p.idx];
 		for (int dim = 0; dim < 3; dim++) {
-			int i0 = 3 * p.idx + dim;
-			triplets.emplace_back(i0, i0, area_per_particles[p.idx]);
-			tripletsInv.emplace_back(i0, i0, 1.0 / area_per_particles[p.idx]);
+			Area[3 * p.idx + dim] = area_per_particles[p.idx];
 		}
 	}
-
-	Area.setFromTriplets(triplets.begin(), triplets.end());
-	Area_inv.setFromTriplets(tripletsInv.begin(), tripletsInv.end());
 }
 
 void Simulation::updateMassMatrix() {
 	M = Area * sceneConfig.fabric.density; // m = d * A
-	M_inv = Area_inv * (1.0 / sceneConfig.fabric.density);
 	for (Particle &p : particles) {
 		p.mass = p.area * sceneConfig.fabric.density;
 	}
@@ -3655,46 +3539,14 @@ void Simulation::initializePrefactoredMatrices() {
 
 	std::printf("precompute matrices + prefactorization...");
 	for (int sysMatId = 0; sysMatId < sysMat.size(); sysMatId++) {
-		std::vector<Triplet> triplets;
-		std::vector<std::vector<Triplet>> triplets_pertype;
-
-		sysMat[sysMatId].constraintNum = 0;
-		for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-			sysMat[sysMatId].constraintNum_pertype[i] = 0;
-			triplets_pertype.emplace_back(std::vector<Triplet>());
-			triplets_pertype[i].reserve(5);
-		}
-		for (int i = 0; i < sysMat[sysMatId].constraints.size(); i++) {
-			Constraint *s = sysMat[sysMatId].constraints[i];
-
-			s->addConstraint(triplets, sysMat[sysMatId].constraintNum, true);
-			s->addConstraint(
-					triplets_pertype[s->constraintType],
-					sysMat[sysMatId].constraintNum_pertype[s->constraintType], false);
-		}
-
-		// The PD system matrices used to be assembled here: A and the
-		// per-type A_pertype from the constraint triplets, their
-		// transposes, C = A^T A h^2, P = C + M, and the LLT
-		// factorization of P. Every one of them was read only by PD's
-		// forward CG loop and PD's adjoint, both of which are gone, so
-		// all that remained was the cost -- sparse transposes and
-		// products over a 3N x constraintNum matrix, plus a sparse
-		// Cholesky on 10902 x 10902 for the dress, none of it ever
-		// consulted again.
+		// PD's system matrices were assembled here -- A and the per-type
+		// A_pertype from constraint triplets, their transposes,
+		// C = A^T A h^2, P = C + M, and the LLT factorization of P --
+		// and were read only by PD's forward CG loop and PD's adjoint.
+		// Both are gone, and so is the triplet walk that fed them.
 		//
-		// The constraint assembly above STAYS. An earlier version of
-		// this comment justified it by saying "constraintNum and
-		// constraintNum_pertype are what the AVBD uploads size
-		// themselves against" -- that was wrong and unchecked; nothing
-		// in the AVBD path reads either field. The real reasons to keep
-		// it are that Constraint::addConstraint and the counters are
-		// shared API, exercised by the PD kernel validators under
-		// tests/slang_validate (assemble_b, pd_{gravity,step,multistep}
-		// _demo, perf_baseline), and that addConstraint also stamps
-		// Constraint::c_idx. Deleting the walk would leave those
-		// counters declared and never set, which is worse than the
-		// small cost of computing them.
+		// AVBD assembles from the same constraint list through
+		// Constraint::addAvbdConstraint; see AvbdAssembly.h.
 
 #ifdef __APPLE__
 
@@ -3808,21 +3660,11 @@ void Simulation::initializePrefactoredMatrices() {
 		}
 #endif  // CLOTH_HAVE_GPU_AVBD
 
-		if (runBackward) {
-			MatXd dp_dfixedpos = MatXd(sysMat[sysMatId].constraintNum,
-					3 * sysMat[sysMatId].fixedPoints.size());
-
-			dp_dfixedpos.setZero();
-
-			for (AttachmentSpring &s : sysMat[sysMatId].attachments) {
-				dp_dfixedpos.block<3, 3>(s.c_idx, s.pfixed_idx * 3) +=
-						s.dp_dfixedPose();
-			}
-
-			// dp_dfixedpos fed A_t_dp_dxfixed, which only PD's adjoint
-			// ever read. Both are gone.
-			(void)dp_dfixedpos;
-		}
+		// dp_dfixedpos was built here and fed A_t_dp_dxfixed, which only
+		// PD's adjoint read. It indexed rows by Constraint::c_idx, which
+		// the removed triplet walk used to stamp, and sized itself from
+		// constraintNum, which nothing sets any more -- an out-of-range
+		// block write waiting to happen. All of it is gone.
 
 		std::printf("\n");
 	}

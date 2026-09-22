@@ -219,30 +219,6 @@ double clamp(double x, double min, double max) {
 	return x;
 }
 
-void Triangle::addConstraint(std::vector<Triplet> &tri, int &c_idx,
-		bool withWeight) {
-	if (withWeight) {
-		this->c_idx = c_idx;
-	} else {
-		this->c_weightless_idx = c_idx;
-	}
-
-	double weightUsed =
-			withWeight ? constrainWeightSqrt : std::sqrt(area_rest * 1);
-
-	for (int i = 0; i < 2; ++i) {
-		for (int dim = 0; dim < 3; dim++) {
-			tri.emplace_back(c_idx + dim + 3 * i, p0()->idx * 3 + dim,
-					-weightUsed * (inv_deltaUV(0, i) + inv_deltaUV(1, i)));
-			tri.emplace_back(c_idx + dim + 3 * i, p1()->idx * 3 + dim,
-					weightUsed * inv_deltaUV(0, i));
-			tri.emplace_back(c_idx + dim + 3 * i, p2()->idx * 3 + dim,
-					weightUsed * inv_deltaUV(1, i));
-		}
-	}
-
-	c_idx += constraintNum;
-}
 
 VecXd Triangle::project(const VecXd &x_vec) const {
 	Mat3x2d newF = projectToManifold(x_vec);
@@ -252,15 +228,6 @@ VecXd Triangle::project(const VecXd &x_vec) const {
 	return ret * constrainWeightSqrt;
 }
 
-VecXd Triangle::dp_dk(
-		const VecXd &x_vec) const { // this is wrong, does not include area
-	Mat3x2d newF = projectToManifold(x_vec);
-
-	Vec6d ret;
-	ret.block<3, 1>(0, 0) = newF.col(0);
-	ret.block<3, 1>(3, 0) = newF.col(1);
-	return ret;
-}
 
 Mat3x2d Triangle::projectToManifold(const VecXd &x_vec) const {
 	Mat3x2d F = getDeformationGradient(x_vec);
@@ -380,15 +347,7 @@ Mat6x9d Triangle::projectToManifoldBackward(const VecXd &x_vec) const {
 	return dF2_dx;
 }
 
-void Triangle::projectBackwardPrecompute(const VecXd &x_vec) {
-	newF = (projectToManifoldBackward(x_vec) * constrainWeightSqrt).cast<float>();
-}
 
-void Triangle::projectBackward(const VecXd &x_vec, TripleVector &triplets) {
-	insertIntoTriplets(triplets, newF, 6, 3, 0, 0, c_idx, p0()->idx * 3);
-	insertIntoTriplets(triplets, newF, 6, 3, 0, 3, c_idx, p1()->idx * 3);
-	insertIntoTriplets(triplets, newF, 6, 3, 0, 6, c_idx, p2()->idx * 3);
-}
 
 std::pair<Mat6x9d, Mat3x2d>
 Triangle::forwardBackwardCheck(const VecXd &x_vec) const {

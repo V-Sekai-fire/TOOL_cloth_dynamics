@@ -62,8 +62,6 @@ public:
 		constrainWeightSqrt = std::sqrt(TriangleBending::k_stiff * 3.0 / (A0 + A1));
 	};
 
-	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
-			bool withWeight) override;
 
 	void addAvbdConstraint(AvbdAssembly &out) const override {
 		if (!out.bending) return;  // AVBD_NO_BENDING=1
@@ -80,11 +78,7 @@ public:
 				: float(constrainWeightSqrt * constrainWeightSqrt));
 	}
 
-	VecXd project(const VecXd &x_vec) const override;
-
-	void projectBackward(const VecXd &x_vec, TripleVector &triplets) override;
-	void projectBackwardPrecompute(const VecXd &x_vec) override;
-	double evaluateEnergy(const VecXd &x_new) override;
+	VecXd project(const VecXd &x_vec) const override;	double evaluateEnergy(const VecXd &x_new) override;
 
 	Mat3x12d backwardGradient(const VecXd &x_vec);
 };

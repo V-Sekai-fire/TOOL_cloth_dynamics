@@ -93,14 +93,8 @@ public:
 
 	Mat3x3d getStretchingHessian(const VecXd &x_vec) const;
 
-	Eigen::VectorXd project(const VecXd &x_vec) const override;
+	Eigen::VectorXd project(const VecXd &x_vec) const override;	double evaluateEnergy(const VecXd &x_new) override;
 
-	void projectBackward(const VecXd &x_vec, TripleVector &triplets) override;
-	void projectBackwardPrecompute(const VecXd &x_vec) override;
-	double evaluateEnergy(const VecXd &x_new) override;
-
-	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
-			bool withWeight) override;
 
 	void addAvbdConstraint(AvbdAssembly &out) const override {
 		out.spP1.push_back(uint32_t(p1_idx));

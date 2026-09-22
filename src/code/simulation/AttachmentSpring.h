@@ -84,11 +84,7 @@ public:
 
 	Vec3d dforce_dk(const VecXd &x_vec) const;
 
-	Eigen::VectorXd project(const VecXd &x_vec) const override;
-
-	void projectBackward(const VecXd &x_vec, TripleVector &triplets) override;
-	void projectBackwardPrecompute(const VecXd &x_vec) override;
-	Mat3x3d dp_dfixedPose() const;
+	Eigen::VectorXd project(const VecXd &x_vec) const override;	Mat3x3d dp_dfixedPose() const;
 
 	double evaluateEnergy(const VecXd &x_new) override;
 
@@ -96,8 +92,6 @@ public:
 		sqrtConstraintWeight = std::sqrt(AttachmentSpring::k_stiff);
 	}
 
-	void addConstraint(std::vector<Triplet> &tri, int &c_idx,
-			bool withWeight) override;
 
 	void addAvbdConstraint(AvbdAssembly &out) const override {
 		out.atVert.push_back(uint32_t(p1_idx));

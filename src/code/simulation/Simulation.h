@@ -389,7 +389,6 @@ public:
 	Vec3d gravity{ 0, -9.8, 0 };
 	Vec3d wind{ 0.01, 0, 1 };
 	Vec3d systemCenter;
-	SpMat dproj_dxnew, dproj_dxnew_t;
 
 	struct SystemMatrix { // All these matrices are constraint weight dependent,
 		// so if constraint weight change, these matrices change
@@ -402,8 +401,6 @@ public:
 		// a sparse Cholesky behind it. Msolver and the unused BiCGSTAB
 		// went the same way: there is no sparse SOLVER left in the
 		// codebase, only sparse matrix types.
-		int constraintNum;
-		int constraintNum_pertype[Constraint::CONSTRAINT_NUM]; // without weight
 		int startFrameNum;
 		std::vector<Constraint *> constraints;
 		std::vector<AttachmentSpring> attachments;
@@ -425,12 +422,8 @@ public:
 			constraints = other.constraints;
 			controlPointSplines = other.controlPointSplines;
 			fixedPoints = other.fixedPoints;
-			constraintNum = other.constraintNum;
 			avbd = other.avbd;  // share; not deep-copied
 
-			for (int i = 0; i < Constraint::CONSTRAINT_NUM; i++) {
-				constraintNum_pertype[i] = other.constraintNum_pertype[i];
-			}
 		}
 	};
 
@@ -467,16 +460,14 @@ public:
 
 	static double *k_stiff_arr[Constraint::CONSTRAINT_NUM];
 
-	VecXd projections_pertype[Constraint::CONSTRAINT_NUM];
-	Eigen::SparseMatrix<double> M, M_inv, Area, Area_inv;
-	VecXd projections;
+	// Diagonal, one entry per (vertex, axis); see updateAreaMatrix.
+	VecXd M, Area;
 
 	VecXd s_n; // intertia term defined in PD (Bouazziz 2014)
 	VecXd x_n, v_n, gravity_n,
 			external_force_field; // velocity and position from previous solved state
 								  // / beginning of current timestep
 	VecXd m_primitives, m_primitivesinv; // primitive mass vectors
-	SpMat dxnew_dxfixed_rhs, P_inv, I;
 	Sphere sphere5, sphere2, sphere_head, sphereForFixedPointRender,
 			veryBigSphere;
 	Bowl bowl;
@@ -796,61 +787,9 @@ public:
 
 	double stepFixPoints(double t);
 
-	void writeMatrix(std::ofstream &myfile, MatXd &A, std::string name,
-			int precision) {
-		myfile << name.c_str() << "\n";
-		myfile << A.rows() << " " << A.cols() << "\n";
-		for (int i = 0; i < A.rows(); i++) {
-			for (int j = 0; j < A.cols(); j++) {
-				myfile << d2str(A(i, j), precision) << " ";
-			}
-			myfile << "\n";
-		}
-	}
 
-	void writeMatrix(std::ofstream &myfile, SpMat &A, std::string name,
-			int precision) {
-		MatXd Adense = A.toDense();
-		myfile << name.c_str() << "\n";
-		myfile << A.rows() << " " << A.cols() << "\n";
 
-		for (int i = 0; i < A.rows(); i++) {
-			for (int j = 0; j < A.cols(); j++) {
-				myfile << d2str(Adense(i, j), precision) << " ";
-			}
-			myfile << "\n";
-		}
-	}
 
-	void writeMatrixSparse(std::ofstream &myfile, SpMat &A, std::string name,
-			int precision) {
-		MatXd Adense = A.toDense();
-		myfile << name.c_str() << "\n";
-		myfile << A.nonZeros() << "\n";
-		myfile << A.rows() << " " << A.cols() << "\n";
-
-		for (int k = 0; k < A.outerSize(); ++k) {
-			for (SpMat::InnerIterator it(A, k); it; ++it) {
-				int r = it.row();
-				int c = it.col();
-				double elem = Adense(it.row(), it.col());
-				myfile << r << " " << c << " " << d2str(elem, precision) << "\n";
-			}
-		}
-	}
-
-	void writeMatrix(std::ofstream &myfile, VecXd &delta_P, std::string name,
-			int precision) {
-		myfile << name.c_str() << "\n";
-		myfile << delta_P.rows() << " " << delta_P.cols() << "\n";
-		for (int i = 0; i < delta_P.rows(); i++) {
-			for (int j = 0; j < delta_P.cols(); j++) {
-				myfile << std::fixed << std::setprecision(precision) << delta_P(i, j)
-					   << " ";
-			}
-			myfile << "\n";
-		}
-	}
 
 	void updateParticleNormals(const VecXd &x_now);
 
@@ -999,10 +938,6 @@ public:
 					std::vector<std::vector<SelfCollisionInformation>>>
 					&detectionInfos);
 
-	std::pair<std::pair<SpMat, SpMat>, VecXd>
-	calculatedr_df(const completeCollisionInfo &infos,
-			bool calculatePrimitiveGradient,
-			bool calculateDensityGradient) const;
 
 	VecXd calculatedr_ddensity(const completeCollisionInfo &detectionInfos,
 			bool calculatePrimitiveGradient) const;

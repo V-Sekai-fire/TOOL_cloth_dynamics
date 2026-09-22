@@ -100,7 +100,6 @@ typedef Eigen::Matrix<double, 6, 6> Mat6x6d;
 typedef Eigen::Matrix<double, 6, 9> Mat6x9d;
 typedef Eigen::Matrix<double, 9, 9> Mat9x9d;
 typedef std::pair<std::string, long long> TimerEntry;
-typedef std::vector<Eigen::Triplet<double>> TripleVector;
 typedef Eigen::Transform<double, 3, Eigen::Affine> Rotation;
 
 struct PerformanceTiming {
@@ -135,8 +134,6 @@ struct Eig {
 };
 typedef Eigen::MatrixXd MatXd;
 typedef Eigen::MatrixXi MatXi;
-typedef Eigen::Triplet<double> Triplet;
-typedef Eigen::SparseMatrix<double> SpMat;
 
 struct DrawSurfObject {
 	float *vertices;

@@ -112,44 +112,5 @@ Eigen::VectorXd Spring::project(const VecXd &x_vec) const {
 	return sqrtConstraintWeight * p;
 }
 
-void Spring::projectBackwardPrecompute(const VecXd &x_vec) {
-	Mat3x3d I_three = Mat3x3d::Identity();
-	Vec3d pos_diff = (p1_vec3(x_vec) - p2_vec3(x_vec));
-	Mat3x3d d_posdiff_dx1 = I_three;
-	Mat3x3d d_posdiff_dx2 = -I_three;
-	Vec3d dir = pos_diff.normalized();
-	Vec3d newPos1, newPos2;
-	double l = pos_diff.norm();
 
-	// TODO: no stiffness, is this right?
-	Mat3x3d ddir_dposdiff = (I_three - dir * dir.transpose()) / l;
-	dp_dx1 = (l0 * ddir_dposdiff * d_posdiff_dx1).cast<float>();
-	dp_dx2 = (l0 * ddir_dposdiff * d_posdiff_dx2).cast<float>();
-}
 
-void Spring::projectBackward(const VecXd &x_vec, TripleVector &triplets) {
-	insertIntoTriplets(triplets, dp_dx1, 3, 3, 0, 0, c_idx, p1()->idx * 3);
-	insertIntoTriplets(triplets, dp_dx2, 3, 3, 0, 0, c_idx, p2()->idx * 3);
-
-	//  dproj_dxnew.block<3,3>(c_idx,p1()->idx * 3) += sqrtConstraintWeight *
-	//  dp_dx1; dproj_dxnew.block<3,3>(c_idx,p2()->idx * 3) +=
-	//  sqrtConstraintWeight *  dp_dx2;
-}
-
-void Spring::addConstraint(std::vector<Triplet> &tri, int &c_idx,
-		bool withWeight) {
-	if (!withWeight) {
-		std::printf("This is a spring constraint, which is deprecated in favor to "
-					"triangle constraint. Should not be included in the backward "
-					"gradient calculation regarding to stiffness parameter\n");
-		exit(0);
-	}
-	this->c_idx = c_idx;
-	double weightUsed = withWeight ? sqrtConstraintWeight : 1;
-
-	for (int dim = 0; dim < 3; ++dim) {
-		tri.emplace_back(c_idx + dim, p1()->idx * 3 + dim, weightUsed);
-		tri.emplace_back(c_idx + dim, p2()->idx * 3 + dim, -weightUsed);
-	}
-	c_idx += constraintNum;
-}
