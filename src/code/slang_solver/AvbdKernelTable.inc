@@ -145,10 +145,11 @@ static const BindingDesc kBindings_attachment_dual_update[] = {
 static const BindingDesc kBindings_triangle_membrane_dual_update[] = {
 	{ "positions", 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
 	{ "idx", 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
-	{ "gamma", 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
+	{ "gamma", 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
 	{ "lambda0", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
 	{ "lambda1", 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
 	{ "inv_deltaUV", 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
+	{ "params", 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, true },
 };
 
 static const BindingDesc kBindings_triangle_bending_dual_update[] = {
@@ -156,8 +157,9 @@ static const BindingDesc kBindings_triangle_bending_dual_update[] = {
 	{ "idx", 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
 	{ "weight", 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
 	{ "nTarget", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
-	{ "gamma", 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true },
+	{ "gamma", 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
 	{ "lambda", 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, false },
+	{ "params", 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, true },
 };
 
 static const BindingDesc kBindings_self_collision_scan[] = {
@@ -288,8 +290,8 @@ static const KernelDesc kKernels[] = {
 	{ "triangle_membrane_force_al", "main", { 64, 1, 1 }, kBindings_triangle_membrane_force_al, 8, -1 },
 	{ "triangle_bending_force_al", "main", { 64, 1, 1 }, kBindings_triangle_bending_force_al, 8, -1 },
 	{ "attachment_dual_update", "main", { 64, 1, 1 }, kBindings_attachment_dual_update, 6, 5 },
-	{ "triangle_membrane_dual_update", "main", { 64, 1, 1 }, kBindings_triangle_membrane_dual_update, 6, -1 },
-	{ "triangle_bending_dual_update", "main", { 64, 1, 1 }, kBindings_triangle_bending_dual_update, 6, -1 },
+	{ "triangle_membrane_dual_update", "main", { 64, 1, 1 }, kBindings_triangle_membrane_dual_update, 7, 6 },
+	{ "triangle_bending_dual_update", "main", { 64, 1, 1 }, kBindings_triangle_bending_dual_update, 7, 6 },
 	{ "self_collision_scan", "main", { 64, 1, 1 }, kBindings_self_collision_scan, 4, 3 },
 	{ "vbd_init_backward", "main", { 64, 1, 1 }, kBindings_vbd_init_backward, 9, 8 },
 	{ "vbd_solve_apply_backward", "main", { 64, 1, 1 }, kBindings_vbd_solve_apply_backward, 5, -1 },

@@ -52,6 +52,10 @@ private def bnd (n : Nat) (name : String) (t : SlangType) : SlangBinding :=
 
 private def body : List SlangStmt :=
   [ .declInit u  "c"     (.member (.var "tid") "x")
+  , .ifThen
+      (.bin ">=" (.var "c") (.member (.var "params") "count"))
+      [ .ret none ]
+      []
   , .declInit f  "n_c"   (.index (.var "nTarget") (.var "c"))
   , .declInit u  "base"  (.bin "*" (.var "c") (.litUint 4))
   , .declInit f  "w0"    (.index (.var "weight") (.var "base"))
@@ -108,16 +112,39 @@ private def body : List SlangStmt :=
         [ .bin "+" (.member (.var "lam") "x") (.bin "*" (.var "g_eff") (.var "ex"))
         , .bin "+" (.member (.var "lam") "y") (.bin "*" (.var "g_eff") (.var "ey"))
         , .bin "+" (.member (.var "lam") "z") (.bin "*" (.var "g_eff") (.var "ez")) ])
+  -- Eq. 16, the adaptive penalty. The bending residual is the vector
+  -- (ex, ey, ez), so |C| is its length. Note this ramps the STORED
+  -- gamma, not g_eff: g_eff is the per-branch effective penalty the
+  -- kernel already derives from gamma, and ramping the derived value
+  -- would compound the branch scaling every iteration.
+  -- See AttachmentDualUpdate for why the clamp is penaltyMax alone.
+  , .declInit f  "Cmag"
+      (.call "sqrt"
+        [ .bin "+"
+            (.bin "+" (.bin "*" (.var "ex") (.var "ex"))
+                      (.bin "*" (.var "ey") (.var "ey")))
+            (.bin "*" (.var "ez") (.var "ez")) ])
+  , .assign (.index (.var "gamma") (.var "c"))
+      (.call "min"
+        [ .bin "+" (.index (.var "gamma") (.var "c"))
+            (.bin "*" (.member (.var "params") "beta") (.var "Cmag"))
+        , .member (.var "params") "penaltyMax" ])
   ]
 
 def shader : SlangShaderModule :=
-  { globals :=
+  { structs :=
+      [ { name := "TriangleBendingDualUpdateParams"
+        , fields := [⟨"beta", f, Semantic.none, none, none, .qIn⟩
+            , ⟨"penaltyMax", f, Semantic.none, none, none, .qIn⟩
+            , ⟨"count", u, Semantic.none, none, none, .qIn⟩ ] } ]
+  , globals :=
       [ bnd 0 "positions" (.roBuf f3)
       , bnd 1 "idx"       (.roBuf u)
       , bnd 2 "weight"    (.roBuf f)
       , bnd 3 "nTarget"   (.roBuf f)
-      , bnd 4 "gamma"     (.roBuf f)
+      , bnd 4 "gamma"     (.rwBuf f)
       , bnd 5 "lambda"    (.rwBuf f3)
+      , ⟨"params", .const "TriangleBendingDualUpdateParams", Semantic.none, some 6, some 0, .qIn⟩
       ]
   , functions := [{
       attrs  := [.shaderCompute, .numthreads 64 1 1]
@@ -129,7 +156,13 @@ def shader : SlangShaderModule :=
     }] }
 
 def expected : String :=
-"[[vk::binding(0, 0)]]
+"struct TriangleBendingDualUpdateParams {
+  float beta;
+  float penaltyMax;
+  uint count;
+};
+
+[[vk::binding(0, 0)]]
 StructuredBuffer<float3> positions;
 [[vk::binding(1, 0)]]
 StructuredBuffer<uint> idx;
@@ -138,13 +171,18 @@ StructuredBuffer<float> weight;
 [[vk::binding(3, 0)]]
 StructuredBuffer<float> nTarget;
 [[vk::binding(4, 0)]]
-StructuredBuffer<float> gamma;
+RWStructuredBuffer<float> gamma;
 [[vk::binding(5, 0)]]
 RWStructuredBuffer<float3> lambda;
+[[vk::binding(6, 0)]]
+ConstantBuffer<TriangleBendingDualUpdateParams> params;
 
 [shader(\"compute\")] [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
   uint c = tid.x;
+  if ((c >= params.count)) {
+    return;
+  }
   float n_c = nTarget[c];
   uint base = (c * 4u);
   float w0 = weight[base];
@@ -177,6 +215,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
   }
   float3 lam = lambda[c];
   lambda[c] = float3((lam.x + (g_eff * ex)), (lam.y + (g_eff * ey)), (lam.z + (g_eff * ez)));
+  float Cmag = sqrt((((ex * ex) + (ey * ey)) + (ez * ez)));
+  gamma[c] = min((gamma[c] + (params.beta * Cmag)), params.penaltyMax);
 }"
 
 example : LeanSlang.emit shader = expected := by native_decide

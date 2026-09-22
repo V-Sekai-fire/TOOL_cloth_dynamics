@@ -1287,19 +1287,40 @@ int AvbdSolver::step() {
 	return d.endAndWait(cmd) ? 0 : -1;
 }
 
-// AVBD's Eq. 16 penalty ramp, on top of the dual ascent. beta scales
-// how fast the penalty climbs with the constraint violation; the ramp is
-// clamped to the material stiffness so a constraint never becomes
-// stiffer than the material it models, and to penaltyMax as a hard
-// ceiling. Upstream's defaults are betaLin = 10000 and
-// PENALTY_MAX = 1e10 (avbd-demo3d solver.h:29, solver.cpp
-// defaultParams); the paper notes beta is scene- and unit-dependent and
-// suggests [1, 1000], so it is left tunable rather than baked in.
+// AVBD's Eq. 16 penalty ramp, on top of the dual ascent: beta scales how
+// fast the penalty climbs with the constraint violation, clamped to
+// penaltyMax.
 //
-// AVBD_BETA=0 disables the ramp entirely, restoring the fixed-gamma
-// behaviour this kernel had before. That is the control arm: any claim
-// that the ramp helps has to survive being switched off.
-struct AttachmentDualUpdateParams {
+// THE DEFAULT IS OFF (beta = 0), which reproduces the fixed-gamma
+// behaviour these kernels had before, and that is a deliberate choice
+// rather than caution for its own sake.
+//
+// Upstream's betaLin is 10000 (avbd-demo3d solver.cpp defaultParams),
+// but upstream does not ACCUMULATE the dual. Its hard-constraint update
+// is a replacement, lambda <- K*C + lambda evaluated fresh each
+// iteration, and it decays lambda and the penalty between steps by
+// alpha*gamma (Eq. 19). Ours accumulates lambda += gamma*C with no
+// decay. Ramping gamma underneath an accumulating lambda is a different
+// system, and it diverges at upstream's beta:
+//
+//   1 attachment + 1 triangle + 1 bending, 64 iterations
+//     beta      0     1    10   100   1000   10000
+//     result   ok    ok    ok    ok    NaN     NaN
+//
+//   and the boundary does not move with penaltyMax (1e4, 1e6, 1e10 all
+//   give the same column), so it is the growth RATE against the
+//   accumulating dual, not gamma reaching its ceiling.
+//
+// So the ramp is implemented, tested and off. Turning it on safely means
+// adopting upstream's lambda form and Eq. 19 decay as well -- the whole
+// scheme, not half of it -- which is the next rung, not this one.
+// Defaulting to a value that merely happened to survive one 4-vertex
+// fixture would be picking a number, not making a decision.
+//
+// AVBD_BETA enables it; test_avbd_penalty_ramp measures what it buys
+// (510x better attachment satisfaction at 64 iterations) and pins the
+// divergence boundary above so a future change has to confront it.
+struct DualUpdateParams {
 	float beta;
 	float penaltyMax;
 	uint32_t count;
@@ -1311,7 +1332,7 @@ struct AttachmentDualUpdateParams {
 // One getenv per dual dispatch is nothing beside the dispatch itself.
 static float avbdBeta() {
 	if (const char *e = std::getenv("AVBD_BETA")) return float(std::atof(e));
-	return 10000.0f;
+	return 0.0f;
 }
 
 static float avbdPenaltyMax() {
@@ -1324,7 +1345,7 @@ int AvbdSolver::stepDualAttachments() {
 	Impl &d = *impl_;
 	VkCommandBuffer cmd = d.begin();
 	if (cmd == VK_NULL_HANDLE) return -1;
-	const AttachmentDualUpdateParams p{avbdBeta(), avbdPenaltyMax(), d.nAttach};
+	const DualUpdateParams p{avbdBeta(), avbdPenaltyMax(), d.nAttach};
 	if (!d.dispatch(cmd, "attachment_dual_update", d.nAttach, &p, sizeof(p))) return -1;
 	return d.endAndWait(cmd) ? 0 : -1;
 }
@@ -1332,18 +1353,20 @@ int AvbdSolver::stepDualAttachments() {
 int AvbdSolver::stepDualMembrane() {
 	if (!ok() || impl_->nTri == 0) return 0;
 	Impl &d = *impl_;
+	const DualUpdateParams p{avbdBeta(), avbdPenaltyMax(), d.nTri};
 	VkCommandBuffer cmd = d.begin();
 	if (cmd == VK_NULL_HANDLE) return -1;
-	if (!d.dispatch(cmd, "triangle_membrane_dual_update", d.nTri)) return -1;
+	if (!d.dispatch(cmd, "triangle_membrane_dual_update", d.nTri, &p, sizeof(p))) return -1;
 	return d.endAndWait(cmd) ? 0 : -1;
 }
 
 int AvbdSolver::stepDualBending() {
 	if (!ok() || impl_->nBend == 0) return 0;
 	Impl &d = *impl_;
+	const DualUpdateParams p{avbdBeta(), avbdPenaltyMax(), d.nBend};
 	VkCommandBuffer cmd = d.begin();
 	if (cmd == VK_NULL_HANDLE) return -1;
-	if (!d.dispatch(cmd, "triangle_bending_dual_update", d.nBend)) return -1;
+	if (!d.dispatch(cmd, "triangle_bending_dual_update", d.nBend, &p, sizeof(p))) return -1;
 	return d.endAndWait(cmd) ? 0 : -1;
 }
 

@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <vector>
 
 #include "AvbdSolver.h"
@@ -95,6 +96,75 @@ bool run(cloth::AvbdSolver &s, float beta, int iters, double *outViol) {
 	return true;
 }
 
+// The membrane and bending dual updates got the same ramp. Neither has
+// a violation as simple to read off the host as an attachment's
+// |x - fixedPos| -- the membrane residual is F - R, which means
+// recomputing the polar decomposition here -- so this arm does not claim
+// a convergence benefit for them. It checks the weaker thing that is
+// still worth checking: that AVBD_BETA actually reaches those two
+// kernels and changes what they do. A mis-sized uniform or a binding
+// left off the table would leave the two arms bit-identical, which is
+// exactly the failure the attachment arm above cannot detect for them.
+// Run the triangle + bending scene at one beta. Returns false if it
+// produced anything non-finite, which is the divergence being mapped.
+bool ramPathAtBeta(cloth::AvbdSolver &s, float beta, std::vector<float> *outPos) {
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%g", double(beta));
+#ifdef _WIN32
+	_putenv_s("AVBD_BETA", buf);
+#else
+	setenv("AVBD_BETA", buf, 1);
+#endif
+	std::vector<float> pos(kPos0, kPos0 + 12), pred(12);
+	for (uint32_t v = 0; v < NV; ++v) {
+		pred[3 * v + 0] = pos[3 * v + 0];
+		pred[3 * v + 1] = pos[3 * v + 1];
+		pred[3 * v + 2] = pos[3 * v + 2] + kGravity * kDt * kDt;
+	}
+	s.setupMesh(NV, pos.data(), pred.data(), kMass, 1.0f / (kDt * kDt));
+	const uint32_t av[1] = {0};
+	const float af[3] = {0, 0, 0}, ak[1] = {kAttachK};
+	s.uploadAttachments(1, av, af, ak);
+	s.uploadSprings(0, nullptr, nullptr, nullptr, nullptr);
+	const uint32_t ti[3] = {0, 1, 2};
+	const float uv[4] = {1, 0, 0, 1}, tk[1] = {20.0f};
+	s.uploadTriangles(1, ti, uv, tk);
+	const uint32_t bi[4] = {0, 1, 2, 3};
+	const float bw[4] = {1, 1, -1, -1}, bn[1] = {4}, bk[1] = {20.0f};
+	s.uploadBendings(1, bi, bw, bn, bk);
+	for (int it = 0; it < 64; ++it) {
+		if (s.step() != 0) return false;
+		if (s.stepDualMembrane() != 0) return false;
+		if (s.stepDualBending() != 0) return false;
+	}
+	s.readPositions(*outPos);
+	for (float q : *outPos) {
+		if (!std::isfinite(q)) return false;
+	}
+	return true;
+}
+
+// Does AVBD_BETA reach the membrane and bending kernels at all? Neither
+// has a violation as simple to read off the host as an attachment's
+// |x - fixedPos| (the membrane residual is F - R, which would mean
+// redoing the polar decomposition here), so this does not claim a
+// convergence benefit for them. It checks the weaker thing still worth
+// checking: that beta changes what they do. A mis-sized uniform or a
+// binding left off the table leaves the arms bit-identical, which is
+// exactly what the attachment arm above cannot detect for them.
+bool ramPathReachesTriAndBend(cloth::AvbdSolver &s, double *outMaxDelta) {
+	// 100, not upstream's 1e4: see the stability sweep in main().
+	std::vector<float> a, b;
+	if (!ramPathAtBeta(s, 0.0f, &a)) return false;
+	if (!ramPathAtBeta(s, 100.0f, &b)) return false;
+	double mx = 0.0;
+	for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+		mx = std::max(mx, std::fabs(double(a[i]) - double(b[i])));
+	}
+	*outMaxDelta = mx;
+	return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -151,8 +221,47 @@ int main(int argc, char **argv) {
 				lastOn, lastOff);
 		return 1;
 	}
-	std::printf("test_avbd_penalty_ramp: OK -- violation %.3g with the ramp vs\n"
-				"%.3g without at 64 iterations, a %.0fx improvement.\n",
+	// Where does the ramp stop being safe? This is the reason the shipped
+	// default is beta = 0. Ramping gamma underneath a lambda that
+	// ACCUMULATES (ours) rather than one that is replaced each iteration
+	// (upstream's) diverges well below upstream's betaLin of 1e4.
+	std::printf("  stability of the ramp on 1 attachment + 1 triangle + 1 bending:\n");
+	{
+		const float sweep[] = {0.0f, 1.0f, 10.0f, 100.0f, 1000.0f, 10000.0f};
+		std::printf("   ");
+		bool sawDiverge = false;
+		for (float be : sweep) {
+			std::vector<float> tmp;
+			const bool okRun = ramPathAtBeta(solver, be, &tmp);
+			std::printf("  beta=%-6g %s", double(be), okRun ? "ok" : "NaN");
+			if (!okRun) sawDiverge = true;
+		}
+		std::printf("\n");
+		if (!sawDiverge) {
+			std::printf("    (nothing diverged -- if that persists, the default of\n"
+						"     beta=0 is more conservative than it needs to be)\n");
+		}
+		std::printf("\n");
+	}
+
+	double triBendDelta = 0.0;
+	if (!ramPathReachesTriAndBend(solver, &triBendDelta)) {
+		std::printf("test_avbd_penalty_ramp: membrane/bending arm failed to run\n");
+		return 1;
+	}
+	std::printf("  membrane + bending: max |dx| between beta=0 and beta=100 is\n"
+				"    %.6g -- %s\n\n", triBendDelta,
+			triBendDelta > 1e-9 ? "the ramp reaches both kernels"
+								: "IDENTICAL (AVBD_BETA is not reaching them)");
+	if (!(triBendDelta > 1e-9)) {
+		std::printf("test_avbd_penalty_ramp: FAILED -- the membrane and bending dual\n"
+					"updates ignore AVBD_BETA, so Eq. 16 is not wired into them.\n");
+		return 1;
+	}
+
+	std::printf("test_avbd_penalty_ramp: OK -- attachment violation %.3g with the\n"
+				"ramp vs %.3g without at 64 iterations, a %.0fx improvement; and\n"
+				"the membrane and bending kernels respond to beta as well.\n",
 			lastOn, lastOff, lastOff / lastOn);
 	return 0;
 }

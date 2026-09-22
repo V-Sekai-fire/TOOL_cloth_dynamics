@@ -73,6 +73,10 @@ private def len3 (x y z : SlangExpr) : SlangExpr :=
 
 private def body : List SlangStmt :=
   [ .declInit u  "c"    (.member (.var "tid") "x")
+  , .ifThen
+      (.bin ">=" (.var "c") (.member (.var "params") "count"))
+      [ .ret none ]
+      []
   , .declInit u  "base" (.bin "*" (.var "c") (.litUint 3))
   , .declInit u  "i0"   (.index (.var "idx") (.var "base"))
   , .declInit u  "i1"   (.index (.var "idx") (.bin "+" (.var "base") (.litUint 1)))
@@ -158,16 +162,43 @@ private def body : List SlangStmt :=
         [ .bin "+" (pmv "l1" "x") (.bin "*" (.var "g") (.var "e1rx"))
         , .bin "+" (pmv "l1" "y") (.bin "*" (.var "g") (.var "e1ry"))
         , .bin "+" (pmv "l1" "z") (.bin "*" (.var "g") (.var "e1rz")) ])
+  -- Eq. 16, the adaptive penalty. The membrane residual is the 3x2
+  -- matrix F - R, so the scalar violation matching a scalar gamma is
+  -- its Frobenius norm: both columns, not one. See
+  -- AttachmentDualUpdate for why the clamp is penaltyMax alone.
+  , .declInit f  "Cmag"
+      (.call "sqrt"
+        [ .bin "+"
+            (.bin "+"
+              (.bin "+"
+                (.bin "+"
+                  (.bin "+" (.bin "*" (.var "e0x") (.var "e0x"))
+                            (.bin "*" (.var "e0y") (.var "e0y")))
+                  (.bin "*" (.var "e0z") (.var "e0z")))
+                (.bin "*" (.var "e1rx") (.var "e1rx")))
+              (.bin "*" (.var "e1ry") (.var "e1ry")))
+            (.bin "*" (.var "e1rz") (.var "e1rz")) ])
+  , .assign (.index (.var "gamma") (.var "c"))
+      (.call "min"
+        [ .bin "+" (.var "g")
+            (.bin "*" (.member (.var "params") "beta") (.var "Cmag"))
+        , .member (.var "params") "penaltyMax" ])
   ]
 
 def shader : SlangShaderModule :=
-  { globals :=
+  { structs :=
+      [ { name := "TriangleMembraneDualUpdateParams"
+        , fields := [⟨"beta", f, Semantic.none, none, none, .qIn⟩
+            , ⟨"penaltyMax", f, Semantic.none, none, none, .qIn⟩
+            , ⟨"count", u, Semantic.none, none, none, .qIn⟩ ] } ]
+  , globals :=
       [ bnd 0 "positions"   (.roBuf f3)
       , bnd 1 "idx"         (.roBuf u)
-      , bnd 2 "gamma"       (.roBuf f)
+      , bnd 2 "gamma"       (.rwBuf f)
       , bnd 3 "lambda0"     (.rwBuf f3)
       , bnd 4 "lambda1"     (.rwBuf f3)
       , bnd 5 "inv_deltaUV" (.roBuf f)
+      , ⟨"params", .const "TriangleMembraneDualUpdateParams", Semantic.none, some 6, some 0, .qIn⟩
       ]
   , functions := [{
       attrs  := [.shaderCompute, .numthreads 64 1 1]
@@ -179,22 +210,33 @@ def shader : SlangShaderModule :=
     }] }
 
 def expected : String :=
-"[[vk::binding(0, 0)]]
+"struct TriangleMembraneDualUpdateParams {
+  float beta;
+  float penaltyMax;
+  uint count;
+};
+
+[[vk::binding(0, 0)]]
 StructuredBuffer<float3> positions;
 [[vk::binding(1, 0)]]
 StructuredBuffer<uint> idx;
 [[vk::binding(2, 0)]]
-StructuredBuffer<float> gamma;
+RWStructuredBuffer<float> gamma;
 [[vk::binding(3, 0)]]
 RWStructuredBuffer<float3> lambda0;
 [[vk::binding(4, 0)]]
 RWStructuredBuffer<float3> lambda1;
 [[vk::binding(5, 0)]]
 StructuredBuffer<float> inv_deltaUV;
+[[vk::binding(6, 0)]]
+ConstantBuffer<TriangleMembraneDualUpdateParams> params;
 
 [shader(\"compute\")] [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
   uint c = tid.x;
+  if ((c >= params.count)) {
+    return;
+  }
   uint base = (c * 3u);
   uint i0 = idx[base];
   uint i1 = idx[(base + 1u)];
@@ -255,6 +297,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
   float3 l1 = lambda1[c];
   lambda0[c] = float3((l0.x + (g * e0x)), (l0.y + (g * e0y)), (l0.z + (g * e0z)));
   lambda1[c] = float3((l1.x + (g * e1rx)), (l1.y + (g * e1ry)), (l1.z + (g * e1rz)));
+  float Cmag = sqrt(((((((e0x * e0x) + (e0y * e0y)) + (e0z * e0z)) + (e1rx * e1rx)) + (e1ry * e1ry)) + (e1rz * e1rz)));
+  gamma[c] = min((g + (params.beta * Cmag)), params.penaltyMax);
 }"
 
 example : LeanSlang.emit shader = expected := by native_decide
