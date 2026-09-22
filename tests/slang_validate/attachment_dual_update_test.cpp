@@ -54,7 +54,21 @@ int main() {
     gamma[1] = 1.0f;
     lambda[1] = Vector<float, 3>(-1.0f, -2.0f, -3.0f);
 
+    // The kernel gained a params block for AVBD's Eq. 16 penalty ramp.
+    // Without it params_0 is a null pointer and the kernel faults on the
+    // first dereference.
+    //
+    // beta = 0 keeps the ramp OFF, which is the behaviour these expected
+    // values were computed against: gamma stays fixed and only the dual
+    // ascent runs. A beta > 0 case needs its own expectations and is a
+    // separate fixture, not a tweak to this one.
+    AttachmentDualUpdateParams_0 dualParams{};
+    dualParams.beta_0 = 0.0f;
+    dualParams.penaltyMax_0 = 1.0e10f;
+    dualParams.count_0 = N_ATTACH;
+
     GlobalParams_0 gp{};
+    gp.params_0 = &dualParams;
     gp.positions_0.data = positions.data();  gp.positions_0.count = positions.size();
     gp.vertIdx_0.data   = vertIdx.data();    gp.vertIdx_0.count   = vertIdx.size();
     gp.fixedPos_0.data  = fixedPos.data();   gp.fixedPos_0.count  = fixedPos.size();

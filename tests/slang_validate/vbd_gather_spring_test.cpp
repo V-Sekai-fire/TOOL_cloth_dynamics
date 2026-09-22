@@ -73,6 +73,10 @@ int main() {
     for (uint32_t i = 0; i < GROUP_SIZE; ++i) vertPerm[i] = i;
     VbdGatherSpringParams_0 paramsBuf{};
     paramsBuf.colorOffset_0 = 0u;
+    // count_0 gates the tid bounds guard the kernel gained; left at
+    // zero by value-initialisation every lane returns immediately and
+    // the test reads back its untouched inputs.
+    paramsBuf.count_0 = N_VERTS;
 
     GlobalParams_0 gp{};
     gp.springGradA_0.data      = springGradA.data();      gp.springGradA_0.count      = springGradA.size();

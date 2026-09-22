@@ -35,6 +35,10 @@ int main() {
     VbdInitParams_0 params{};
     params.invHSquared_0 = 2.0f;
     params.colorOffset_0 = 0u;
+    // count_0 gates the tid bounds guard the kernel gained; left at
+    // zero by value-initialisation every lane returns immediately and
+    // the test reads back its untouched inputs.
+    params.count_0 = N_VERTS;
 
     std::vector<Vector<float, 3>> positions(GROUP_SIZE, Vector<float, 3>(0.0f));
     std::vector<Vector<float, 3>> predicted(GROUP_SIZE, Vector<float, 3>(0.0f));

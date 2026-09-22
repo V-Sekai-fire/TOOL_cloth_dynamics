@@ -3646,9 +3646,18 @@ void Simulation::initializePrefactoredMatrices() {
 		// Cholesky on 10902 x 10902 for the dress, none of it ever
 		// consulted again.
 		//
-		// The constraint triplets are still walked above because
-		// constraintNum and constraintNum_pertype are what the AVBD
-		// uploads size themselves against.
+		// The constraint assembly above STAYS. An earlier version of
+		// this comment justified it by saying "constraintNum and
+		// constraintNum_pertype are what the AVBD uploads size
+		// themselves against" -- that was wrong and unchecked; nothing
+		// in the AVBD path reads either field. The real reasons to keep
+		// it are that Constraint::addConstraint and the counters are
+		// shared API, exercised by the PD kernel validators under
+		// tests/slang_validate (assemble_b, pd_{gravity,step,multistep}
+		// _demo, perf_baseline), and that addConstraint also stamps
+		// Constraint::c_idx. Deleting the walk would leave those
+		// counters declared and never set, which is worse than the
+		// small cost of computing them.
 
 #ifdef __APPLE__
 
