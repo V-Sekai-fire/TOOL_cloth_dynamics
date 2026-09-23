@@ -171,7 +171,14 @@ private def body : List SlangStmt :=
                       (.bin "*" (.var "sy") (.var "sy")))
             (.bin "*" (.var "sz") (.var "sz")))
       , .declInit f  "len" (.call "sqrt" [.var "len2"])
-      , .declInit f  "scale" (.bin "/" (.var "n_c") (.var "len"))
+      -- |s| = 0: the residual's direction s/|s| is undefined; take e = 0
+      -- (scale 1), not n_c/0 = inf and 0 * inf = NaN. A hinge whose rest
+      -- |s| is at float noise (Gate 5's fitted skirt at drape scale 10:
+      -- n_c 1.66e-6 against terms ~30) can sum to exactly 0 on the GPU,
+      -- whose FMA contraction rounds differently from the CPU.
+      , .declInit f  "scale"
+          (.ternary (.bin ">" (.var "len") (.litFloat 0.0))
+            (.bin "/" (.var "n_c") (.var "len")) (.litFloat 1.0))
       , .declInit f  "om"    (.bin "-" (.litFloat 1.0) (.var "scale"))
       , .declInit f  "ex"  (.bin "*" (.var "sx") (.var "om"))
       , .declInit f  "ey"  (.bin "*" (.var "sy") (.var "om"))
@@ -188,8 +195,11 @@ private def body : List SlangStmt :=
                       (.bin "*" (.var "Ay") (.var "sy")))
             (.bin "*" (.var "Az") (.var "sz")))
       , .declInit f  "len3" (.bin "*" (.var "len") (.var "len2"))
+      -- The forward's |s| = 0 branch is e = 0: no derivative there.
       , .declInit f  "factor"
-          (.bin "/" (.bin "*" (.var "k") (.bin "*" (.var "n_c") (.var "AdotS"))) (.var "len3"))
+          (.ternary (.bin ">" (.var "len") (.litFloat 0.0))
+            (.bin "/" (.bin "*" (.var "k") (.bin "*" (.var "n_c") (.var "AdotS"))) (.var "len3"))
+            (.litFloat 0.0))
       , .declInit f  "kom" (.bin "*" (.var "k") (.var "om"))
       , .declInit f  "tx"
           (.bin "+" (.bin "*" (.var "kom") (.var "Ax")) (.bin "*" (.var "factor") (.var "sx")))
@@ -214,8 +224,10 @@ private def body : List SlangStmt :=
       , .assign (.var "vlz") (.var "Az")
       , .assign (.var "vk")  (.bin "+" (.var "AdotE") (.var "HW"))
       , .assign (.var "vn")
-          (.bin "-" (.litFloat 0.0)
-            (.bin "/" (.bin "*" (.var "k") (.var "AdotS")) (.var "len")))
+          (.ternary (.bin ">" (.var "len") (.litFloat 0.0))
+            (.bin "-" (.litFloat 0.0)
+              (.bin "/" (.bin "*" (.var "k") (.var "AdotS")) (.var "len")))
+            (.litFloat 0.0))
       ]
   , .assign (.index (.var "v_p") (.var "base"))
       (.call "float3" [.var "vpx0", .var "vpy0", .var "vpz0"])
@@ -333,7 +345,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float sz = (((w0 * p0.z) + (w1 * p1.z)) + ((w2 * p2.z) + (w3 * p3.z)));
     float len2 = (((sx * sx) + (sy * sy)) + (sz * sz));
     float len = sqrt(len2);
-    float scale = (n_c / len);
+    float scale = ((len > 0.000000) ? (n_c / len) : 1.000000);
     float om = (1.000000 - scale);
     float ex = (sx * om);
     float ey = (sy * om);
@@ -342,7 +354,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float AdotE = (((Ax * ex) + (Ay * ey)) + (Az * ez));
     float AdotS = (((Ax * sx) + (Ay * sy)) + (Az * sz));
     float len3 = (len * len2);
-    float factor = ((k * (n_c * AdotS)) / len3);
+    float factor = ((len > 0.000000) ? ((k * (n_c * AdotS)) / len3) : 0.000000);
     float kom = (k * om);
     float tx = ((kom * Ax) + (factor * sx));
     float ty = ((kom * Ay) + (factor * sy));
@@ -363,7 +375,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     vly = Ay;
     vlz = Az;
     vk = (AdotE + HW);
-    vn = (0.000000 - ((k * AdotS) / len));
+    vn = ((len > 0.000000) ? (0.000000 - ((k * AdotS) / len)) : 0.000000);
   }
   v_p[base] = float3(vpx0, vpy0, vpz0);
   v_p[(base + 1u)] = float3(vpx1, vpy1, vpz1);

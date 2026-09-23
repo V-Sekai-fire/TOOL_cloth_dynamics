@@ -100,7 +100,14 @@ private def body : List SlangStmt :=
                 (.bin "+" (.bin "*" (.var "sx") (.var "sx"))
                           (.bin "*" (.var "sy") (.var "sy")))
                 (.bin "*" (.var "sz") (.var "sz")) ])
-      , .declInit f  "scale" (.bin "/" (.var "n_c") (.var "len"))
+      -- |s| = 0: the residual's direction s/|s| is undefined; take e = 0
+      -- (scale 1), not n_c/0 = inf and 0 * inf = NaN. A hinge whose rest
+      -- |s| is at float noise (Gate 5's fitted skirt at drape scale 10:
+      -- n_c 1.66e-6 against terms ~30) can sum to exactly 0 on the GPU,
+      -- whose FMA contraction rounds differently from the CPU.
+      , .declInit f  "scale"
+          (.ternary (.bin ">" (.var "len") (.litFloat 0.0))
+            (.bin "/" (.var "n_c") (.var "len")) (.litFloat 1.0))
       , .declInit f  "om"    (.bin "-" (.litFloat 1.0) (.var "scale"))
       , .assign (.var "ex")  (.bin "*" (.var "sx") (.var "om"))
       , .assign (.var "ey")  (.bin "*" (.var "sy") (.var "om"))
@@ -208,7 +215,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float sy = (((w0 * p0.y) + (w1 * p1.y)) + ((w2 * p2.y) + (w3 * p3.y)));
     float sz = (((w0 * p0.z) + (w1 * p1.z)) + ((w2 * p2.z) + (w3 * p3.z)));
     float len = sqrt((((sx * sx) + (sy * sy)) + (sz * sz)));
-    float scale = (n_c / len);
+    float scale = ((len > 0.000000) ? (n_c / len) : 1.000000);
     float om = (1.000000 - scale);
     ex = (sx * om);
     ey = (sy * om);
