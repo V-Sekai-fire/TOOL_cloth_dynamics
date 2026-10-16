@@ -12,10 +12,10 @@ permissions:
 
 jobs:
   validate:
-    # macos-14 (Apple Silicon) is what curvenet's matching pipeline uses
+    # macos-15 (Apple Silicon) is what curvenet's matching pipeline uses
     # and what slangc has the cleanest prebuilt assets for. macos-13 Intel
     # runners are also fine but slower.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
